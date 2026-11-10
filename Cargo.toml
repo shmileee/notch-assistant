@@ -1,0 +1,22 @@
+[package]
+name = "notch-assistant"
+version = "0.1.0"
+edition = "2024"
+description = "A Dynamic-Island-style panel that expands from the MacBook notch, built with Rune."
+license = "MIT"
+
+[dependencies]
+# Rune is pre-release: pin a rev of `dev` (it is never rewritten).
+rune = { git = "https://github.com/anomalyco/rune", rev = "70eff81165e9854834a75f17753edb6c96ab2ab7" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "70eff81165e9854834a75f17753edb6c96ab2ab7" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5.2"
+objc2-foundation = { version = "0.2.2", features = ["NSArray", "NSGeometry"] }
+objc2-app-kit = { version = "0.2.2", features = ["NSScreen", "NSLayoutConstraint", "NSEvent"] }
+
+[profile.release]
+debug = false
