@@ -7,6 +7,8 @@ monitor it sits in the middle of the menu bar as a "virtual notch" as tall as th
 
 ![Open panel](snaps/open.png)
 
+**Demo video:** [demo/notch-assistant.mp4](demo/notch-assistant.mp4) (32 s: hover, tabs, Settings, connecting).
+
 | Collapsed | Incidents | Off hours |
 | --- | --- | --- |
 | ![](snaps/collapsed.png) | ![](snaps/incidents.png) | ![](snaps/offhours.png) |
@@ -44,6 +46,7 @@ secondary is the previous week's primary. Shifts are assumed to run Mon 09:00 to
 | `src/store.rs` | Secrets in the Keychain (written via `security -i`, so a secret never appears on a command line), the rest in settings.json. |
 | `src/settings.rs` | The Settings window, built from the registry. |
 | `src/firehydrant.rs` | The FireHydrant client, its `INTEGRATION` declaration, and the five-minute refresh thread. |
+| `src/demo.rs` | Demo mode for recordings: pinned clock, in-memory settings, the backdrop, the Settings window's place. |
 
 ### Adding an integration
 
@@ -52,6 +55,26 @@ secondary is the previous week's primary. Shifts are assumed to run Mon 09:00 to
 2. Fetch its data on a worker thread, as `firehydrant::spawn` does, and give it a tab or card in the panel.
 3. Another kind of auth (an OAuth sign-in, say) is a new `FieldKind` with its own control in
    `settings.rs`, a "Connect" button for instance, which stores the tokens it gets with `store::set_secret`.
+
+## Recording a demo video
+
+```sh
+scripts/record-demo.sh                 # → demo/notch-assistant.mp4
+```
+
+It runs the real app in demo mode on the MacBook's display and records it with `screencapture`, while
+`scripts/demo/driver.swift` moves the pointer, clicks and types. Keep hands off the mouse and keyboard
+for the ~35 s it runs. Your terminal needs Screen Recording and Accessibility permission, plus `ffmpeg`
+and the Xcode command-line tools. A running copy of the app is stopped first and relaunched afterwards.
+
+Demo mode (`NOTCH_DEMO=1`, see `src/demo.rs`) makes every recording the same and keeps it private:
+mock data with the clock pinned to Tue 10 Nov 2026 14:05, settings kept in memory (your Keychain is
+untouched), a simulated connection test, and a backdrop that covers the desktop and menu bar.
+
+**When you add a feature,** add its steps to `tour` in `driver.swift`. Positions are in points from the
+display's top-left, taken from the layout in `src/view.rs` and `src/settings.rs`; update `Spot` when the
+layout moves. To check positions without recording, run the app with `NOTCH_DEMO=1` (add
+`NOTCH_OPEN_SETTINGS=1` to open Settings at launch) and take a screenshot.
 
 ## Checking it headlessly
 
