@@ -4,6 +4,7 @@
 //! `cargo run -- --scene open --snap snaps/open.png` (scenes: collapsed, open, incidents,
 //! offhours).
 
+mod demo;
 mod firehydrant;
 mod integrations;
 mod island;
@@ -42,7 +43,7 @@ pub struct State {
     /// Keeps that thread alive; dropping it stops the thread.
     pub control: Option<Sender<()>>,
     pub waker: Option<rune::Waker>,
-    /// Scenes pin the clock so snapshots are reproducible.
+    /// Scenes pin the clock and the notch so snapshots are reproducible.
     pub frozen: bool,
 }
 
@@ -52,13 +53,20 @@ static MOCK_ONLY: OnceLock<bool> = OnceLock::new();
 thread_local! {
     /// The Settings window, opened from the panel (handlers run on the main thread).
     static SETTINGS: RefCell<Option<AppHandle<settings::Settings>>> = const { RefCell::new(None) };
+    /// Demo mode: where Settings opens (a display and a rect in its points).
+    static SETTINGS_PLACE: RefCell<Option<(DisplayTarget, OverlayPlacement)>> = const { RefCell::new(None) };
 }
 
 pub fn open_settings() {
-    SETTINGS.with(|s| if let Some(handle) = s.borrow().as_ref() { handle.open(); handle.focus(); });
+    SETTINGS.with(|s| if let Some(handle) = s.borrow().as_ref() {
+        if let Some((display, rect)) = SETTINGS_PLACE.with(|p| p.borrow().clone()) { handle.place(display, rect); }
+        handle.open();
+        handle.focus();
+    });
 }
 
-fn now() -> NaiveDateTime { Local::now().naive_local() }
+/// The time the panel shows: pinned in demo mode.
+fn now() -> NaiveDateTime { if demo::on() { demo::time() } else { Local::now().naive_local() } }
 
 /// Who "you" are in the mock rotation (`NOTCH_ME`, default OP).
 fn mock_me() -> String { std::env::var("NOTCH_ME").unwrap_or_else(|_| "OP".into()) }
@@ -90,6 +98,13 @@ fn start_fetching(s: &mut State, wake: rune::Waker) {
 pub fn connect(s: &mut State) {
     s.control = None; // stops the old thread
     s.results = None;
+    if demo::on() {
+        // Demo: the mock, shown as live once a key is "saved" in Settings.
+        s.data = oncall::mock("OP", now());
+        if firehydrant::INTEGRATION.configured() { s.data.origin = Origin::Live { at: now() }; }
+        s.snap = Snapshot::build(&s.data, now());
+        return;
+    }
     let client = if *MOCK_ONLY.get().unwrap_or(&false) { None } else { firehydrant::Client::from_settings() };
     match (client, s.waker.clone()) {
         (Some(client), Some(wake)) => {
@@ -160,7 +175,7 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
 }
 
 /// Tuesday 10 November 2026, 14:05: the user is primary this week.
-fn demo_time(day: u32, h: u32, m: u32) -> NaiveDateTime {
+fn scene_time(day: u32, h: u32, m: u32) -> NaiveDateTime {
     NaiveDate::from_ymd_opt(2026, 11, day).unwrap().and_hms_opt(h, m, 0).unwrap()
 }
 fn freeze(s: &mut State, at: NaiveDateTime) {
@@ -173,10 +188,10 @@ fn freeze(s: &mut State, at: NaiveDateTime) {
 fn spec() -> AppSpec<State> {
     AppSpec {
         scenes: &[
-            ("collapsed", |s| freeze(s, demo_time(10, 14, 5))),
-            ("open", |s| { freeze(s, demo_time(10, 14, 5)); s.island = Island::Open; }),
-            ("incidents", |s| { freeze(s, demo_time(10, 14, 5)); s.island = Island::Open; s.tab = Tab::Incidents; }),
-            ("offhours", |s| { freeze(s, demo_time(14, 11, 30)); s.island = Island::Open; }),
+            ("collapsed", |s| freeze(s, scene_time(10, 14, 5))),
+            ("open", |s| { freeze(s, scene_time(10, 14, 5)); s.island = Island::Open; }),
+            ("incidents", |s| { freeze(s, scene_time(10, 14, 5)); s.island = Island::Open; s.tab = Tab::Incidents; }),
+            ("offhours", |s| { freeze(s, scene_time(14, 11, 30)); s.island = Island::Open; }),
         ],
         poll: Some(poll),
         ..AppSpec::new("Notch", view::CANVAS, init, view::view)
@@ -218,17 +233,28 @@ fn main() {
     // Headless tooling renders mock scenes; only a real launch reads the token.
     let headless = args.iter().any(|a| a.starts_with("--snap") || a.starts_with("--script") || a.starts_with("--tree") || a.starts_with("--list"));
     let _ = MOCK_ONLY.set(headless || std::env::var_os("NOTCH_MOCK").is_some());
+    if demo::on() { store::use_memory(); }
 
     rune::prewarm_gpu();
-    rune::run_windows_with(RunOptions { accessory: true }, move |_displays| {
+    rune::run_windows_with(RunOptions { accessory: true }, move |displays| {
         let mut app = App::new(spec()).windowless();
+        // Demo: a backdrop over the notched display, under everything the app shows.
+        let builtin = notch::builtin_display()
+            .and_then(|id| displays.iter().find(|d| d.native_id() == Some(rune::NativeDisplayId::MacOS(id))));
+        if let (true, Some(display)) = (demo::on(), builtin) {
+            let target = DisplayTarget::Native(display.native_id().unwrap());
+            let backdrop = app.overlay(OverlaySpec::new("Backdrop", (1.0, 1.0), demo::backdrop).options(OverlayOptions {
+                display: target, placement: Some(OverlayPlacement::FullScreen), input: OverlayInput::None, prewarm: true, ..Default::default()
+            }).macos_level(demo::BACKDROP_LEVEL), demo::Backdrop);
+            backdrop.show();
+        }
         let overlay = app.overlay(OverlaySpec::new("Notch", view::CANVAS, view::view).options(OverlayOptions {
             // On the display under the pointer, moving with it from screen to screen.
             display: DisplayTarget::UnderPointer,
             follow_pointer: true,
             placement: Some(OverlayPlacement::Edge { edge: ScreenEdge::Top, margin: 0.0, align: Align::Center, inset: 0.0 }),
             // Above the menu bar; only the island itself (`.hit()`) takes the pointer.
-            level: OverlayLevel::AboveStatus,
+            level: if demo::on() { OverlayLevel::AboveOverlays } else { OverlayLevel::AboveStatus },
             input: OverlayInput::Regions,
             prewarm: true,
             ..Default::default()
@@ -236,10 +262,24 @@ fn main() {
         overlay.show();
         // Settings: an ordinary window, hidden until opened from the panel.
         let spec = AppSpec { setup: Some(settings::setup), poll: Some(settings::poll),
-            ..AppSpec::new("Notch assistant settings", (680.0, 470.0), || settings::Settings::new(None), settings::view) };
+            ..AppSpec::new("Notch assistant settings", demo::SETTINGS_SIZE, || settings::Settings::new(None), settings::view) };
+        let options = rune::WindowOptions { visible: false, min_size: Some((560.0, 420.0)), ..Default::default() };
+        let options = match (demo::on(), builtin) {
+            // Demo: centred on the notched display, below the panel, above the backdrop.
+            (true, Some(d)) => {
+                let (w, h) = demo::SETTINGS_SIZE;
+                let width = (d.size.0 as f64 / d.scale) as f32;
+                let rect = OverlayPlacement::Rect { x: (width - w) / 2.0, y: demo::SETTINGS_TOP, width: w, height: h };
+                SETTINGS_PLACE.with(|p| *p.borrow_mut() = Some((DisplayTarget::Native(d.native_id().unwrap()), rect)));
+                options.macos(rune::MacWindowOptions::default().level(demo::SETTINGS_LEVEL))
+            }
+            _ => options.into(),
+        };
         let (settings_app, _) = app.window(WindowSpec::new("settings", spec).state(settings::Settings::new(Some(overlay.clone())))
-            .options(rune::WindowOptions { visible: false, min_size: Some((560.0, 420.0)), ..Default::default() }));
+            .configured_options(options));
+        // NOTCH_OPEN_SETTINGS=1 opens Settings at launch (handy for checking its layout).
         SETTINGS.with(|s| *s.borrow_mut() = Some(settings_app));
+        if std::env::var_os("NOTCH_OPEN_SETTINGS").is_some() { open_settings(); }
         // The headless tools snapshot this (never shown) window with the same view and scenes.
         vec![WindowSpec::from_app("notch", app).options(rune::WindowOptions { transparent: true, ..Default::default() })]
     });

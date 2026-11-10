@@ -13,12 +13,22 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Map, Value};
 
+/// Demo mode keeps everything in memory, so a recording never touches real settings.
+static MEMORY: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> = std::sync::Mutex::new(None);
+
+pub fn use_memory() { *MEMORY.lock().unwrap() = Some(Default::default()); }
+
+fn memory<R>(f: impl FnOnce(&mut std::collections::HashMap<String, String>) -> R) -> Option<R> {
+    MEMORY.lock().unwrap().as_mut().map(f)
+}
+
 const SERVICE: &str = "notch-assistant";
 const SECURITY: &str = "/usr/bin/security";
 
 fn account(integration: &str, field: &str) -> String { format!("{integration}.{field}") }
 
 pub fn secret(integration: &str, field: &str) -> Option<String> {
+    if let Some(v) = memory(|m| m.get(&account(integration, field)).cloned()) { return v; }
     keychain_read(SERVICE, &account(integration, field))
 }
 
@@ -32,12 +42,16 @@ fn keychain_read(service: &str, account: &str) -> Option<String> {
 }
 
 /// Reads an item stored before settings existed (service only, any account).
-pub fn legacy_secret(service: &str) -> Option<String> { keychain_read(service, "") }
+pub fn legacy_secret(service: &str) -> Option<String> {
+    if memory(|_| ()).is_some() { return None; }
+    keychain_read(service, "")
+}
 
 pub fn set_secret(integration: &str, field: &str, value: &str) -> Result<(), String> {
     if value.chars().any(|c| c.is_control() || c == '"' || c == '\\') {
         return Err("the value has characters a key can't contain (quotes, backslashes or control characters)".into());
     }
+    if memory(|m| m.insert(account(integration, field), value.to_string())).is_some() { return Ok(()); }
     let command = format!("add-generic-password -U -s {SERVICE} -a {} -l \"Notch assistant: {integration}\" -w \"{value}\"\n", account(integration, field));
     let mut child = Command::new(SECURITY).arg("-i").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped())
         .spawn().map_err(|e| format!("couldn't run security: {e}"))?;
@@ -51,12 +65,14 @@ pub fn set_secret(integration: &str, field: &str, value: &str) -> Result<(), Str
 }
 
 pub fn delete_secret(integration: &str, field: &str) {
+    if memory(|m| m.remove(&account(integration, field))).is_some() { return; }
     let _ = Command::new(SECURITY).args(["delete-generic-password", "-s", SERVICE, "-a", &account(integration, field)])
         .stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
 /// Deletes an item stored before settings existed.
 pub fn delete_legacy(service: &str) {
+    if memory(|_| ()).is_some() { return; }
     let _ = Command::new(SECURITY).args(["delete-generic-password", "-s", service])
         .stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
@@ -72,11 +88,13 @@ fn load() -> Map<String, Value> {
 }
 
 pub fn setting(integration: &str, field: &str) -> Option<String> {
+    if let Some(v) = memory(|m| m.get(&format!("setting:{integration}.{field}")).cloned()) { return v.filter(|s| !s.trim().is_empty()); }
     load().get(integration)?.get(field)?.as_str().map(str::to_string).filter(|s| !s.trim().is_empty())
 }
 
 /// Sets (or, with an empty value, clears) one setting.
 pub fn set_setting(integration: &str, field: &str, value: &str) -> Result<(), String> {
+    if memory(|m| m.insert(format!("setting:{integration}.{field}"), value.trim().to_string())).is_some() { return Ok(()); }
     let path = settings_path().ok_or("no home folder")?;
     let mut all = load();
     let section = all.entry(integration).or_insert_with(|| Value::Object(Map::new()));

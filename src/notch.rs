@@ -52,3 +52,21 @@ pub fn under_pointer() -> NotchGeo {
 
 #[cfg(not(target_os = "macos"))]
 pub fn under_pointer() -> NotchGeo { NotchGeo::default() }
+
+/// The built-in display's CGDirectDisplayID (the one with the notch), if it's on.
+#[cfg(target_os = "macos")]
+pub fn builtin_display() -> Option<u32> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+        fn CGDisplayIsBuiltin(display: u32) -> u32;
+    }
+    let (mut ids, mut count) = ([0u32; 16], 0u32);
+    unsafe {
+        if CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) != 0 { return None; }
+        ids[..count as usize].iter().copied().find(|&id| CGDisplayIsBuiltin(id) != 0)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn builtin_display() -> Option<u32> { None }

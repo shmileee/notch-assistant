@@ -43,6 +43,10 @@ pub const INTEGRATION: Integration = Integration {
 };
 
 fn test() -> Result<String, String> {
+    if crate::demo::on() {
+        std::thread::sleep(Duration::from_millis(1200));
+        return Ok("Connected to Team SRE EMEA: 50 shifts in the next five weeks, 2 active incidents, you are OP".into());
+    }
     let client = Client::from_settings().ok_or("No API key saved")?;
     let data = client.fetch(Local::now().naive_local())?;
     let you = data.shifts.iter().find(|s| s.user_id == data.me).map(|s| s.who.clone());
@@ -142,6 +146,7 @@ impl Client {
 
 /// This Mac account's full name: who "you" are on the schedule unless the settings say.
 fn account_name() -> Option<String> {
+    if crate::demo::on() { return Some("Your full name".into()); }
     static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
         let out = std::process::Command::new("/usr/bin/id").arg("-F").output().ok()?;
