@@ -21,6 +21,8 @@ With Homebrew (Apple silicon, macOS 13 or later):
 brew install --cask shmileee/tap/notch-assistant
 ```
 
+If `/Applications` needs an admin password on your Mac, add `--appdir ~/Applications`.
+
 Then open Notch Assistant from Spotlight, click the ⚙ in the panel, and add your FireHydrant API key and
 team ID. Without them it shows mock data.
 
