@@ -1,6 +1,6 @@
 [package]
 name = "notch-assistant"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A Dynamic-Island-style panel that expands from the MacBook notch, built with Rune."
 license = "MIT"

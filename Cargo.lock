@@ -1709,7 +1709,7 @@ dependencies = [
 
 [[package]]
 name = "notch-assistant"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "objc2 0.5.3",

@@ -23,6 +23,10 @@ brew install --cask shmileee/tap/notch-assistant
 
 If `/Applications` needs an admin password on your Mac, add `--appdir ~/Applications`.
 
+`brew upgrade` and `brew uninstall` need no extra step: the app restarts itself when a new version
+replaces it, and quits when it's removed (`src/installed.rs`). Homebrew's own quit is skipped on Macs
+whose login comes from single sign-on.
+
 Then open Notch Assistant from Spotlight, click the ⚙ in the panel, and add your FireHydrant API key and
 team ID. Without them it shows mock data.
 
@@ -79,6 +83,7 @@ secondary is the previous week's primary. Shifts are assumed to run Mon 09:00 to
 | `src/integrations.rs` | The integration registry: each one declares its fields (`Secret` or `Text`), the env vars that override them, and a connection test. |
 | `src/store.rs` | Secrets in the Keychain (written via `security -i`, so a secret never appears on a command line), the rest in settings.json. |
 | `src/settings.rs` | The Settings window, built from the registry. |
+| `src/installed.rs` | Restarts the app when its installed copy is replaced (an upgrade) and quits it when removed. |
 | `src/login.rs` | Open at login, as a macOS login item (`SMAppService`); only the app bundle can register. |
 | `scripts/bundle.sh`, `Makefile` | The app bundle (Info.plist, icon, ad-hoc signature), install, uninstall and release zip. |
 | `src/firehydrant.rs` | The FireHydrant client, its `INTEGRATION` declaration, and the five-minute refresh thread. |

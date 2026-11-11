@@ -6,6 +6,7 @@
 
 mod demo;
 mod firehydrant;
+mod installed;
 mod integrations;
 mod island;
 mod login;
@@ -46,6 +47,8 @@ pub struct State {
     pub waker: Option<rune::Waker>,
     /// Scenes pin the clock and the notch so snapshots are reproducible.
     pub frozen: bool,
+    /// The installed app's executable, to restart on a new version or quit once removed.
+    pub installed: Option<installed::Watch>,
 }
 
 /// Mock data only: headless tooling, or `NOTCH_MOCK`. Set once in `main`.
@@ -78,6 +81,11 @@ pub fn quit() {
     SETTINGS.with(|s| if let Some(handle) = s.borrow().as_ref() { handle.quit() });
 }
 
+/// Quits and starts the app again from its bundle (a new version installed over it).
+fn relaunch() {
+    SETTINGS.with(|s| if let Some(handle) = s.borrow().as_ref() { handle.relaunch() });
+}
+
 /// The time the panel shows: pinned in demo mode.
 fn now() -> NaiveDateTime { if demo::on() { demo::time() } else { Local::now().naive_local() } }
 
@@ -97,6 +105,7 @@ fn init() -> State {
         control: None,
         waker: None,
         frozen: false,
+        installed: installed::Watch::new(),
     }
 }
 
@@ -152,6 +161,11 @@ fn take_results(s: &mut State) -> bool {
 /// the view shows changed, so an idle island draws nothing.
 fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
+    match s.installed.as_mut().and_then(|w| w.check(clock)) {
+        Some(installed::Change::Replaced) => { eprintln!("installed: a new version, restarting"); relaunch(); }
+        Some(installed::Change::Removed) => { eprintln!("installed: the app was removed, quitting"); quit(); }
+        None => {}
+    }
     // The overlay follows the pointer between displays; reshape the island to the notch (real
     // or virtual) of the display it's now on, without animating the jump.
     if !s.frozen {
