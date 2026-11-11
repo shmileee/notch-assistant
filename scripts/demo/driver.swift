@@ -28,7 +28,7 @@ enum Spot {
     static let notch = CGPoint(x: cx, y: 12)
     static let onCallTab = CGPoint(x: cx - 285, y: 16)
     static let incidentsTab = CGPoint(x: cx - 210, y: 16)
-    static let connect = CGPoint(x: cx + 85, y: 16)
+    static let connect = CGPoint(x: cx + 165, y: 16)   // "Mock · Connect", right of the notch
     static let panelWeek = CGPoint(x: cx - 120, y: 240)
     static func settings(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: cx - 340 + x, y: 380 + y) }
     static let apiKey = settings(400, 135)

@@ -104,19 +104,21 @@ fn notice(title: &str, detail: Option<&str>) -> El {
     c
 }
 
-/// Where the data comes from, so mock or stale data is never mistaken for live.
-fn origin_label(snap: &Snapshot) -> El {
+/// Where the data comes from, so mock or stale data is never mistaken for live. `compact`
+/// beside a real notch, where the strip is narrow.
+fn origin_label(snap: &Snapshot, compact: bool) -> El {
     let (text, color) = match &snap.origin {
-        Origin::Mock => ("Mock data · Connect".to_string(), amber()),
+        Origin::Mock => ((if compact { "Mock · Connect" } else { "Mock data · Connect" }).to_string(), amber()),
         Origin::Loading => ("Loading…".to_string(), dim()),
-        Origin::Live { at } if snap.now - *at < Duration::minutes(1) => ("Live".to_string(), green()),
+        // It refreshes every 5 minutes, so the age only matters once a refresh was missed.
+        Origin::Live { at } if snap.now - *at < Duration::minutes(10) => ("Live".to_string(), green()),
         Origin::Live { at } => (format!("Live · {} ago", span(snap.now - *at)), green()),
         Origin::Error { stale: Some(at), .. } => (format!("Offline · {} old", span(snap.now - *at)), red()),
         Origin::Error { stale: None, .. } => ("Offline".to_string(), red()),
     };
-    let mut l = row().key("origin").gap(5.0).items_center().px(6.0).h(20.0).radius(10.0)
+    let mut l = row().key("origin").shrink().gap(5.0).items_center().px(6.0).h(20.0).radius(10.0)
         .child(el().size(6.0, 6.0).radius(3.0).fill(color))
-        .child(label(text, 11.0, 500.0, dim()));
+        .child(label(text, 11.0, 500.0, dim()).shrink().truncate());
     // Mock or failing: a click opens Settings to connect.
     if matches!(snap.origin, Origin::Mock | Origin::Error { .. }) {
         l = l.hit().hover(WHITE.alpha(0.1)).on_press(|_: &mut State| crate::open_settings());
@@ -126,7 +128,14 @@ fn origin_label(snap: &Snapshot) -> El {
 
 fn tab_key(tab: Tab) -> &'static str { match tab { Tab::OnCall => "tab-oncall", Tab::Incidents => "tab-incidents" } }
 
+/// Space kept clear on each side of a real notch.
+const NOTCH_MARGIN: f32 = 10.0;
+
 /// The strip beside the notch: tabs on the left wing, the clock on the right.
+///
+/// A real notch hides whatever is drawn under it (screenshots still show it, the display
+/// doesn't), so there the strip is two wings with the notch's width kept empty between them,
+/// and the right wing shortens its text to fit. A virtual notch hides nothing.
 fn top_bar(s: &State) -> El {
     let tab = |tab: Tab, name: &'static str, badge: Option<usize>| {
         let on = s.tab == tab;
@@ -145,11 +154,22 @@ fn top_bar(s: &State) -> El {
     let quit = el().key("quit").hit().size(22.0, 22.0).radius(11.0).center().hover(WHITE.alpha(0.12))
         .on_press(|_: &mut State| crate::quit())
         .child(label("×", 14.0, 500.0, WHITE.alpha(0.4)));
-    let clock = label(s.snap.now.format("%a %-d %b  %H:%M").to_string(), 12.0, 600.0, WHITE);
-    row().w_full().h(s.geo.height.max(30.0)).px(14.0).items_center()
-        .child(row().gap(2.0).child(tab(Tab::OnCall, "On-call", None)).child(tab(Tab::Incidents, "Incidents", Some(s.snap.incidents.len()))))
-        .child(spacer())
-        .child(row().gap(10.0).items_center().child(origin_label(&s.snap)).child(clock).child(row().gap(2.0).child(gear).child(quit)))
+    let real = s.geo.real;
+    let clock = label(s.snap.now.format(if real { "%H:%M" } else { "%a %-d %b  %H:%M" }).to_string(), 12.0, 600.0, WHITE);
+    let tabs = row().gap(2.0).child(tab(Tab::OnCall, "On-call", None)).child(tab(Tab::Incidents, "Incidents", Some(s.snap.incidents.len())));
+    let status = row().shrink().gap(10.0).items_center()
+        .child(origin_label(&s.snap, real)).child(clock).child(row().gap(2.0).child(gear).child(quit));
+    let (pad, bar) = (14.0, row().w_full().h(s.geo.height.max(30.0)).items_center());
+    if !real {
+        return bar.px(pad).child(tabs).child(spacer()).child(status);
+    }
+    // Wings and the gap add up to the panel's width; each wing clips what doesn't fit.
+    let gap = s.geo.width + 2.0 * NOTCH_MARGIN;
+    let wing = ((PANEL.0 - gap) / 2.0 - pad).max(0.0);
+    bar.px(pad)
+        .child(row().key("wing-left").w(wing).items_center().clip_rounded(0.0).child(tabs))
+        .child(el().key("notch-gap").w(gap))
+        .child(row().key("wing-right").w(wing).items_center().justify_end().clip_rounded(0.0).child(status))
 }
 
 fn card() -> El { col().radius(16.0).fill(WHITE.alpha(0.07)).padding(14.0).gap(10.0) }
