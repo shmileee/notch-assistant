@@ -1,7 +1,7 @@
 //! On-call data: shifts and incidents, from FireHydrant (`firehydrant.rs`) or the mock here,
 //! and the `Snapshot` the view renders from them at a given moment.
 //!
-//! The mock mirrors Team SRE EMEA's calendar in FireHydrant (November 2026): two weekly
+//! The mock is modelled on a real team's calendar in FireHydrant (November 2026): two weekly
 //! rotations, primary and secondary, Monday 09:00 to Friday 17:00, where the secondary is
 //! always last week's primary.
 
@@ -100,7 +100,7 @@ pub fn mock(me: &str, now: NaiveDateTime) -> Data {
     let shifts = (0..10).flat_map(|i| week_shifts(monday + Duration::weeks(i))).collect();
     let person = |s: &str| Some((s.to_string(), s.to_string()));
     Data {
-        team: "Team SRE EMEA".into(),
+        team: "Team SRE".into(),
         me: me.into(),
         shifts,
         incidents: vec![

@@ -19,8 +19,6 @@ use crate::integrations::{Field, FieldKind, Integration};
 use crate::oncall::{Data, Incident, Origin, Role, Shift, initials, monday_of};
 
 const API: &str = "https://api.firehydrant.io";
-/// Team SRE EMEA.
-pub const DEFAULT_TEAM: &str = "14fd434d-8b7a-4ddf-b0c7-a4a94caf3abe";
 
 pub const INTEGRATION: Integration = Integration {
     id: "firehydrant",
@@ -32,7 +30,7 @@ pub const INTEGRATION: Integration = Integration {
             placeholder: || "Paste the key".into() },
         Field { key: "team_id", label: "Team ID", kind: FieldKind::Text, env: "FIREHYDRANT_TEAM_ID",
             help: "From the team's URL: app.firehydrant.io/…/teams/<team ID>/overview.",
-            placeholder: || DEFAULT_TEAM.into() },
+            placeholder: || "The team's ID, a UUID".into() },
         Field { key: "me", label: "Your name on the schedule", kind: FieldKind::Text, env: "FIREHYDRANT_ME",
             help: "An API key acts as a bot user, so your shifts are found by name (or FireHydrant user ID).",
             placeholder: || account_name().unwrap_or_default() },
@@ -45,7 +43,7 @@ pub const INTEGRATION: Integration = Integration {
 fn test() -> Result<String, String> {
     if crate::demo::on() {
         std::thread::sleep(Duration::from_millis(1200));
-        return Ok("Connected to Team SRE EMEA: 50 shifts in the next five weeks, 2 active incidents, you are OP".into());
+        return Ok("Connected to Team SRE: 50 shifts in the next five weeks, 2 active incidents, you are OP".into());
     }
     let client = Client::from_settings().ok_or("No API key saved")?;
     let data = client.fetch(Local::now().naive_local())?;
@@ -65,7 +63,7 @@ impl Client {
     /// A client from the saved settings; `None` without an API key.
     pub fn from_settings() -> Option<Self> {
         let token = INTEGRATION.value("api_key")?;
-        let team_id = INTEGRATION.value_or_default("team_id");
+        let team_id = INTEGRATION.value("team_id").unwrap_or_default();
         let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(20)).user_agent("notch-assistant").build();
         Some(Client { token, team_id, agent })
     }
@@ -85,6 +83,7 @@ impl Client {
 
     /// Raw JSON of every call, for `--probe-raw`.
     pub fn raw(&self, now: NaiveDateTime) -> Result<Vec<(String, Value)>, String> {
+        self.check_team()?;
         let (start, end) = window(now);
         Ok(vec![
             ("current_user".into(), self.get("/v1/current_user", &[])?),
@@ -93,7 +92,12 @@ impl Client {
         ])
     }
 
+    fn check_team(&self) -> Result<(), String> {
+        if self.team_id.is_empty() { Err("no team ID: add it in Settings (or set FIREHYDRANT_TEAM_ID)".into()) } else { Ok(()) }
+    }
+
     pub fn fetch(&self, now: NaiveDateTime) -> Result<Data, String> {
+        self.check_team()?;
         let token_user = self.get("/v1/current_user", &[])?;
         let token_user = str_at(&token_user, "id").unwrap_or_default().to_string();
         let hint = Some(INTEGRATION.value_or_default("me")).filter(|h| !h.is_empty());
@@ -146,7 +150,7 @@ impl Client {
 
 /// This Mac account's full name: who "you" are on the schedule unless the settings say.
 fn account_name() -> Option<String> {
-    if crate::demo::on() { return Some("Your full name".into()); }
+    if crate::sandboxed() { return Some("Your full name".into()); }
     static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
         let out = std::process::Command::new("/usr/bin/id").arg("-F").output().ok()?;

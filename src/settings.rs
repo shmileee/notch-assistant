@@ -49,12 +49,12 @@ impl Settings {
             FieldKind::Text => TextEdit::new(&store::setting(i.id, f.key).unwrap_or_default()),
         }).collect();
         self.saved = i.fields.iter().map(|f| f.kind == FieldKind::Secret && i.value(f.key).is_some()).collect();
-        // The demo never touches the real login items.
-        self.login = if crate::demo::on() { Login::Off } else { login::status() };
+        // The demo and snapshots never touch the real login items.
+        self.login = if crate::sandboxed() { Login::Off } else { login::status() };
     }
 
     fn toggle_login(&mut self) {
-        if crate::demo::on() { return; }
+        if crate::sandboxed() { return; }
         let on = self.login == Login::Off;
         self.status = match login::set(on) {
             Ok(Login::NeedsApproval) => Status::Ok("Allow Notch Assistant in System Settings › General › Login Items".into()),

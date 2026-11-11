@@ -15,6 +15,17 @@ monitor it sits in the middle of the menu bar as a "virtual notch" as tall as th
 
 ## Install
 
+With Homebrew (Apple silicon, macOS 13 or later):
+
+```sh
+brew install --cask shmileee/tap/notch-assistant
+```
+
+Then open Notch Assistant from Spotlight, click the ⚙ in the panel, and add your FireHydrant API key and
+team ID. Without them it shows mock data.
+
+From source:
+
 ```sh
 make install       # builds "Notch Assistant.app" into ~/Applications, starts it, opens it at login
 make uninstall     # stops it and removes the app and the login item (settings and Keychain stay)
@@ -25,8 +36,13 @@ Afterwards, start it from Spotlight or Finder like any app. Open at login can be
 (bottom left) or System Settings › General › Login Items, or with
 `"~/Applications/Notch Assistant.app/Contents/MacOS/notch-assistant" --login on|off|status`.
 
-The app is ad-hoc signed, not notarized: fine on the Mac that built it. `make dist` zips it for a
-release. `make icon` redraws `assets/AppIcon.icns` from `scripts/icon.swift`.
+The app is ad-hoc signed, not notarized: fine on the Mac that built it, and the cask clears the
+quarantine flag for downloads. `make icon` redraws `assets/AppIcon.icns` from `scripts/icon.swift`.
+
+**Releasing.** Bump `version` in `Cargo.toml`, commit, then tag and push (`git tag v0.2.0 && git push --tags`).
+`.github/workflows/release.yml` builds the app on an Apple-silicon runner and attaches
+`NotchAssistant-<version>-arm64.zip` to the GitHub release; `make dist` makes the same zip locally.
+Renovate in the tap then proposes the cask's new version and checksum.
 
 ## Run from source
 
@@ -46,7 +62,7 @@ Stop the installed copy first (one island is enough). Open at login only works f
 - **Collapsed**: a dot on the left of the notch (green: you're primary, amber: secondary, grey: off call)
   and the current primary's avatar on the right.
 
-The mock copies Team SRE EMEA's November 2026 calendar: weekly rotations DB → OP → RW → KB, where the
+The mock is modelled on a real team's November 2026 calendar: weekly rotations DB → OP → RW → KB, where the
 secondary is the previous week's primary. Shifts are assumed to run Mon 09:00 to Fri 17:00.
 
 ## How it works

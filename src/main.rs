@@ -50,6 +50,12 @@ pub struct State {
 
 /// Mock data only: headless tooling, or `NOTCH_MOCK`. Set once in `main`.
 static MOCK_ONLY: OnceLock<bool> = OnceLock::new();
+/// Headless tooling (snapshots, scripts). Set once in `main`.
+static HEADLESS: OnceLock<bool> = OnceLock::new();
+
+/// Demo mode or headless tooling: settings in memory and no personal details (your name,
+/// Keychain, login items), so recordings and snapshots show nothing of yours.
+pub fn sandboxed() -> bool { demo::on() || *HEADLESS.get().unwrap_or(&false) }
 
 thread_local! {
     /// The Settings window, opened from the panel (handlers run on the main thread).
@@ -244,7 +250,8 @@ fn main() {
     // Headless tooling renders mock scenes; only a real launch reads the token.
     let headless = args.iter().any(|a| a.starts_with("--snap") || a.starts_with("--script") || a.starts_with("--tree") || a.starts_with("--list"));
     let _ = MOCK_ONLY.set(headless || std::env::var_os("NOTCH_MOCK").is_some());
-    if demo::on() { store::use_memory(); }
+    let _ = HEADLESS.set(headless);
+    if sandboxed() { store::use_memory(); }
 
     rune::prewarm_gpu();
     rune::run_windows_with(RunOptions { accessory: true }, move |displays| {
