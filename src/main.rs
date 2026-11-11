@@ -65,6 +65,12 @@ pub fn open_settings() {
     });
 }
 
+/// Quits the app. The panel's × can't use `Tx::quit`: an overlay has no window, and Rune drops
+/// window requests (close, quit) made from one, so the quit goes through the Settings handle.
+pub fn quit() {
+    SETTINGS.with(|s| if let Some(handle) = s.borrow().as_ref() { handle.quit() });
+}
+
 /// The time the panel shows: pinned in demo mode.
 fn now() -> NaiveDateTime { if demo::on() { demo::time() } else { Local::now().naive_local() } }
 
@@ -275,8 +281,12 @@ fn main() {
             }
             _ => options.into(),
         };
-        let (settings_app, _) = app.window(WindowSpec::new("settings", spec).state(settings::Settings::new(Some(overlay.clone())))
-            .configured_options(options));
+        let mut settings_spec = WindowSpec::new("settings", spec).state(settings::Settings::new(Some(overlay.clone())))
+            .configured_options(options);
+        // ⌘Q while Settings is in front (the panel never takes key focus, so it can't get ⌘Q).
+        let quit_key = "cmd+q".parse().expect("a valid shortcut");
+        settings_spec.app = settings_spec.app.menu_item(rune::MenuItem::new("Quit Notch Assistant", |_, tx: &mut Tx| tx.quit()).key_equivalent(quit_key));
+        let (settings_app, _) = app.window(settings_spec);
         // NOTCH_OPEN_SETTINGS=1 opens Settings at launch (handy for checking its layout).
         SETTINGS.with(|s| *s.borrow_mut() = Some(settings_app));
         if std::env::var_os("NOTCH_OPEN_SETTINGS").is_some() { open_settings(); }

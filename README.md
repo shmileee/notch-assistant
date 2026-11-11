@@ -19,7 +19,7 @@ monitor it sits in the middle of the menu bar as a "virtual notch" as tall as th
 cargo run --release
 ```
 
-It runs as an accessory app, so it has no Dock icon and no menu. To quit, use the × in the open panel or `pkill notch-assistant`.
+It runs as an accessory app, so it has no Dock icon and no menu. To quit, click the × in the open panel, press ⌘Q while Settings is in front, or run `pkill notch-assistant`.
 `NOTCH_ME=DB` changes who "you" are in the rotation (the default is `OP`).
 
 ## What it shows (mock data for now)

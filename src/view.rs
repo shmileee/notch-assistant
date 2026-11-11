@@ -143,7 +143,7 @@ fn top_bar(s: &State) -> El {
         .on_press(|_: &mut State| crate::open_settings())
         .child(label("⚙", 13.0, 500.0, WHITE.alpha(0.55)));
     let quit = el().key("quit").hit().size(22.0, 22.0).radius(11.0).center().hover(WHITE.alpha(0.12))
-        .on_press_tx(|_: &mut State, tx| tx.quit())
+        .on_press(|_: &mut State| crate::quit())
         .child(label("×", 14.0, 500.0, WHITE.alpha(0.4)));
     let clock = label(s.snap.now.format("%a %-d %b  %H:%M").to_string(), 12.0, 600.0, WHITE);
     row().w_full().h(s.geo.height.max(30.0)).px(14.0).items_center()
