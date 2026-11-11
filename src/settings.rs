@@ -8,9 +8,10 @@ use std::sync::mpsc::{Receiver, channel};
 
 use rune::tok::{self, TextStyle};
 use rune::{Color, Cx, El, OverlayHandle, TextEdit, Tx, Waker, col, el, row, spacer, text};
-use rune_kit::{Button, ButtonVariant, Kit, TextInput};
+use rune_kit::{Button, ButtonVariant, Kit, Switch, TextInput};
 
 use crate::integrations::{ALL, FieldKind, Integration};
+use crate::login::{self, Login};
 use crate::store;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -27,11 +28,13 @@ pub struct Settings {
     waker: Option<Waker>,
     /// The panel, told to reconnect when settings change.
     panel: Option<OverlayHandle<crate::State>>,
+    /// Open at login (read when the window opens and after a change).
+    pub login: Login,
 }
 
 impl Settings {
     pub fn new(panel: Option<OverlayHandle<crate::State>>) -> Self {
-        let mut s = Settings { selected: 0, edits: vec![], saved: vec![], status: Status::Idle, tests: None, waker: None, panel };
+        let mut s = Settings { selected: 0, edits: vec![], saved: vec![], status: Status::Idle, tests: None, waker: None, panel, login: Login::Unavailable };
         s.load();
         s
     }
@@ -46,6 +49,19 @@ impl Settings {
             FieldKind::Text => TextEdit::new(&store::setting(i.id, f.key).unwrap_or_default()),
         }).collect();
         self.saved = i.fields.iter().map(|f| f.kind == FieldKind::Secret && i.value(f.key).is_some()).collect();
+        // The demo never touches the real login items.
+        self.login = if crate::demo::on() { Login::Off } else { login::status() };
+    }
+
+    fn toggle_login(&mut self) {
+        if crate::demo::on() { return; }
+        let on = self.login == Login::Off;
+        self.status = match login::set(on) {
+            Ok(Login::NeedsApproval) => Status::Ok("Allow Notch Assistant in System Settings › General › Login Items".into()),
+            Ok(_) => Status::Idle,
+            Err(e) => Status::Err(e),
+        };
+        self.login = login::status();
     }
 
     fn select(&mut self, index: usize) {
@@ -122,6 +138,17 @@ pub fn view(s: &Settings, cx: &mut Cx<Settings>) -> El {
             .child(el().size(7.0, 7.0).radius(3.5).fill(if i.configured() { green } else { th.text_secondary.alpha(0.4) }))
             .child(text(i.name).font(t(13.0, if on { 600.0 } else { 500.0 })).color(th.text)));
     }
+
+    // Open at login, at the bottom of the sidebar; only the installed app can do it.
+    let general = match s.login {
+        Login::Unavailable => col().gap(2.0).px(8.0)
+            .child(text("Open at login").font(t(12.5, 600.0)).color(th.text_secondary))
+            .child(text("Install the app (make install or brew) to start it at login").font(t(11.0, 400.0)).color(th.text_secondary).wrap()),
+        login => col().px(8.0).child(Switch::new(login != Login::Off).label("Open at login")
+            .on_toggle(|s: &mut Settings| s.toggle_login()).build(&k).key("login")),
+    };
+    sidebar = sidebar.child(spacer()).child(general)
+        .child(text(format!("Version {}", env!("CARGO_PKG_VERSION"))).font(t(10.5, 500.0)).color(th.text_secondary.alpha(0.7)).px(8.0).pt(10.0));
 
     let i = s.integration();
     let mut form = col().grow(1.0).min_w(0.0).h_full().gap(18.0).padding(28.0).pt(36.0)

@@ -13,13 +13,29 @@ monitor it sits in the middle of the menu bar as a "virtual notch" as tall as th
 | --- | --- | --- |
 | ![](snaps/collapsed.png) | ![](snaps/incidents.png) | ![](snaps/offhours.png) |
 
-## Run
+## Install
+
+```sh
+make install       # builds "Notch Assistant.app" into ~/Applications, starts it, opens it at login
+make uninstall     # stops it and removes the app and the login item (settings and Keychain stay)
+```
+
+`INSTALL_DIR=/Applications make install` installs it for every user, and `LOGIN=0` skips open at login.
+Afterwards, start it from Spotlight or Finder like any app. Open at login can be switched in Settings
+(bottom left) or System Settings › General › Login Items, or with
+`"~/Applications/Notch Assistant.app/Contents/MacOS/notch-assistant" --login on|off|status`.
+
+The app is ad-hoc signed, not notarized: fine on the Mac that built it. `make dist` zips it for a
+release. `make icon` redraws `assets/AppIcon.icns` from `scripts/icon.swift`.
+
+## Run from source
 
 ```sh
 cargo run --release
 ```
 
 It runs as an accessory app, so it has no Dock icon and no menu. To quit, click the × in the open panel, press ⌘Q while Settings is in front, or run `pkill notch-assistant`.
+Stop the installed copy first (one island is enough). Open at login only works from the installed app.
 `NOTCH_ME=DB` changes who "you" are in the rotation (the default is `OP`).
 
 ## What it shows (mock data for now)
@@ -45,6 +61,8 @@ secondary is the previous week's primary. Shifts are assumed to run Mon 09:00 to
 | `src/integrations.rs` | The integration registry: each one declares its fields (`Secret` or `Text`), the env vars that override them, and a connection test. |
 | `src/store.rs` | Secrets in the Keychain (written via `security -i`, so a secret never appears on a command line), the rest in settings.json. |
 | `src/settings.rs` | The Settings window, built from the registry. |
+| `src/login.rs` | Open at login, as a macOS login item (`SMAppService`); only the app bundle can register. |
+| `scripts/bundle.sh`, `Makefile` | The app bundle (Info.plist, icon, ad-hoc signature), install, uninstall and release zip. |
 | `src/firehydrant.rs` | The FireHydrant client, its `INTEGRATION` declaration, and the five-minute refresh thread. |
 | `src/demo.rs` | Demo mode for recordings: pinned clock, in-memory settings, the backdrop, the Settings window's place. |
 

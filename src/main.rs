@@ -8,6 +8,7 @@ mod demo;
 mod firehydrant;
 mod integrations;
 mod island;
+mod login;
 mod notch;
 mod oncall;
 mod settings;
@@ -233,6 +234,10 @@ fn probe(raw: bool) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--login") {
+        std::process::exit(login::cli(args.get(i + 1).map(String::as_str)));
+    }
+    if args.iter().any(|a| a == "--version") { return println!("notch-assistant {}", env!("CARGO_PKG_VERSION")); }
     if args.iter().any(|a| a == "--probe" || a == "--probe-raw") {
         return probe(args.iter().any(|a| a == "--probe-raw"));
     }
