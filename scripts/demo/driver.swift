@@ -29,6 +29,7 @@ enum Spot {
     static let onCallTab = CGPoint(x: cx - 285, y: 16)
     static let incidentsTab = CGPoint(x: cx - 210, y: 16)
     static let connect = CGPoint(x: cx + 165, y: 16)   // "Mock · Connect", right of the notch
+    static let gear = CGPoint(x: cx + 281, y: 16)      // ⚙, beside the clock
     static let panelWeek = CGPoint(x: cx - 120, y: 240)
     static func settings(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: cx - 340 + x, y: 380 + y) }
     static let apiKey = settings(400, 135)
@@ -90,7 +91,7 @@ let tour: [Step] = [
     step(2.2) { move(Spot.panelWeek, 0.6); wait(1.6) },                           // the rotation strip
     step(2.2) { move(Spot.desk, 0.7); wait(1.5) },                                // leave: it closes
     step(2.0) { move(Spot.notch, 0.8); wait(1.2) },                               // back
-    step(2.3) { move(Spot.connect, 0.6); wait(0.4); click(); wait(1.3) },         // "Mock data · Connect" opens Settings
+    step(2.3) { move(Spot.gear, 0.6); wait(0.4); click(); wait(1.3) },            // ⚙ opens Settings
     step(3.4) { move(Spot.apiKey, 0.8); click(); wait(0.4); type("fhb-demo-7c1e9a2b4d6f8e0a3b5c"); wait(0.8) },
     step(3.6) { move(Spot.save, 0.6); click(); wait(3.0) },                       // save, test passes
     step(3.6) { move(Spot.notch, 1.0); wait(2.6) },                               // the panel now says Live
