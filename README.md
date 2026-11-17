@@ -85,8 +85,8 @@ cargo run -- --scene collapsed --script scripts/hover.json --snap mid.png --at 0
 ```
 
 Scenes and demo mode use the mock with the clock pinned to Tue 10 Nov 2026, 14:05, so images are
-reproducible. The mock is modelled on a real team's calendar: weekly rotations DB → OP → RW → KB, Monday
-09:00 to Friday 17:00, where the secondary is last week's primary. `NOTCH_ME=DB` changes who "you" are in
+reproducible. The mock is modelled on a real team's calendar: weekly rotations ZQ → OP → XV → JY, Monday
+09:00 to Friday 17:00, where the secondary is last week's primary. `NOTCH_ME=ZQ` changes who "you" are in
 it (default `OP`).
 
 **Recording the demo video.** `scripts/record-demo.sh` writes `demo/notch-assistant.mp4`. It runs the app

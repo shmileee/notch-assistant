@@ -76,10 +76,10 @@ pub fn initials(name: &str) -> String {
     }
 }
 
-/// The rotation order seen in the calendar: DB → OP → RW → KB → DB …
-const ORDER: [&str; 4] = ["DB", "OP", "RW", "KB"];
+/// The rotation order seen in the calendar: ZQ → OP → XV → JY → ZQ …
+const ORDER: [&str; 4] = ["ZQ", "OP", "XV", "JY"];
 
-fn anchor() -> NaiveDate { NaiveDate::from_ymd_opt(2026, 11, 2).unwrap() } // DB's primary week
+fn anchor() -> NaiveDate { NaiveDate::from_ymd_opt(2026, 11, 2).unwrap() } // ZQ's primary week
 
 pub fn monday_of(d: NaiveDate) -> NaiveDate { d - Duration::days(d.weekday().num_days_from_monday() as i64) }
 
@@ -100,12 +100,12 @@ pub fn mock(me: &str, now: NaiveDateTime) -> Data {
     let shifts = (0..10).flat_map(|i| week_shifts(monday + Duration::weeks(i))).collect();
     let person = |s: &str| Some((s.to_string(), s.to_string()));
     Data {
-        team: "Team SRE".into(),
+        team: "Team Marmalade".into(),
         me: me.into(),
         shifts,
         incidents: vec![
             Incident { severity: "SEV2".into(), title: "Elevated 5xx on api-gateway (eu-west-1)".into(), status: "Investigating".into(), commander: person("OP"), started: now - Duration::minutes(14) },
-            Incident { severity: "SEV3".into(), title: "Kafka consumer lag on telemetry-ingest".into(), status: "Mitigated".into(), commander: person("DB"), started: now - Duration::minutes(96) },
+            Incident { severity: "SEV3".into(), title: "Kafka consumer lag on telemetry-ingest".into(), status: "Mitigated".into(), commander: person("ZQ"), started: now - Duration::minutes(96) },
         ],
         origin: Origin::Mock,
     }
@@ -218,7 +218,7 @@ mod tests {
     fn the_mock_matches_the_firehydrant_calendar() {
         let got: Vec<_> = snap(at(10, 14, 5)).weeks.iter()
             .map(|(d, p, s)| (d.day(), p.clone().unwrap().0, s.clone().unwrap().0)).collect();
-        let want = [(9, "OP", "DB"), (16, "RW", "OP"), (23, "KB", "RW"), (30, "DB", "KB"), (7, "OP", "DB")];
+        let want = [(9, "OP", "ZQ"), (16, "XV", "OP"), (23, "JY", "XV"), (30, "ZQ", "JY"), (7, "OP", "ZQ")];
         assert_eq!(got, want.map(|(d, p, s)| (d, p.to_string(), s.to_string())));
     }
 
@@ -240,7 +240,7 @@ mod tests {
         let day = |d: u32, who: &str, role| Shift { role, user_id: who.into(), who: who.into(), start: at(d, 9, 0), end: at(d, 16, 0) };
         let mut shifts: Vec<Shift> = (9..=13).map(|d| day(d, "OP", Role::Primary)).collect();
         shifts.extend((16..=20).map(|d| day(d, "OP", Role::Secondary)));
-        shifts.extend((16..=20).map(|d| day(d, "RW", Role::Primary)));
+        shifts.extend((16..=20).map(|d| day(d, "XV", Role::Primary)));
         let data = Data { team: "T".into(), me: "OP".into(), shifts, incidents: vec![], origin: Origin::Mock };
 
         let s = Snapshot::build(&data, at(10, 11, 0));

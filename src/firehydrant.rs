@@ -43,7 +43,7 @@ pub const INTEGRATION: Integration = Integration {
 fn test() -> Result<String, String> {
     if crate::demo::on() {
         std::thread::sleep(Duration::from_millis(1200));
-        return Ok("Connected to Team SRE: 50 shifts in the next five weeks, 2 active incidents, you are OP".into());
+        return Ok("Connected to Team Marmalade: 50 shifts in the next five weeks, 2 active incidents, you are OP".into());
     }
     let client = Client::from_settings().ok_or("No API key saved")?;
     let data = client.fetch(Local::now().naive_local())?;
