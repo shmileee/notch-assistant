@@ -68,6 +68,10 @@ impl Settings {
         if index != self.selected { self.selected = index; self.status = Status::Idle; self.load(); }
     }
 
+    pub fn select_id(&mut self, id: &str) {
+        if let Some(index) = ALL.iter().position(|i| i.id == id) { self.select(index); }
+    }
+
     fn save(&mut self, tx: &mut Tx) {
         let i = self.integration();
         for (f, edit) in i.fields.iter().zip(&mut self.edits) {
@@ -93,11 +97,12 @@ impl Settings {
         }
         self.load();
         self.reconnect_panel();
-        self.status = Status::Ok(if i.configured() { "Removed. An environment variable still provides the key".into() } else { "Removed. The panel is back on mock data".into() });
+        self.status = Status::Ok(if i.configured() { "Removed. An environment variable still provides it".into() } else { "Removed. The panel is back on mock data".into() });
     }
 
     fn reconnect_panel(&self) {
-        if let Some(panel) = &self.panel { panel.update(|s, _| crate::connect(s)); }
+        let id = self.integration().id;
+        if let Some(panel) = &self.panel { panel.update(move |s, _| crate::reconnect(s, id)); }
     }
 
     fn test(&mut self, _: &mut Tx) {

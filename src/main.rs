@@ -2,16 +2,25 @@
 //!
 //! `cargo run --release` puts it at the top of whichever display the pointer is on. Headless stills, with no window:
 //! `cargo run -- --scene open --snap snaps/open.png` (scenes: collapsed, open, incidents,
-//! offhours).
+//! offhours, pulls, linear, peek).
+//!
+//! Open, the panel has a sidebar of integrations (FireHydrant, GitHub, Linear) and shows the
+//! selected one's data beside it.
 
 mod demo;
+mod feed;
 mod firehydrant;
+mod github;
 mod installed;
 mod integrations;
 mod island;
+mod issues;
+mod linear;
 mod login;
 mod notch;
 mod oncall;
+mod pulls;
+mod read;
 mod settings;
 mod store;
 mod view;
@@ -28,15 +37,37 @@ use rune::{Align, App, AppHandle, AppSpec, DisplayTarget, OverlayInput, OverlayL
 use island::{Event, Island};
 use notch::NotchGeo;
 use oncall::{Data, Origin, Snapshot};
+use feed::Feed;
+use issues::Issues;
+use pulls::Pulls;
+use read::ReadState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tab { OnCall, Incidents }
+pub enum Section { FireHydrant, GitHub, Linear }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FireView { OnCall, Incidents }
+
+/// Something new, shown under the collapsed island for a few seconds. Opening the panel from
+/// it goes to its section.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Peek {
+    pub section: Section,
+    /// Who did it, for the avatar.
+    pub who: String,
+    pub headline: String,
+    pub detail: String,
+    pub until: f64,
+}
+
+const PEEK_SECONDS: f64 = 6.0;
 
 pub struct State {
     pub geo: NotchGeo,
     pub island: Island,
     pub seq: Seq,
-    pub tab: Tab,
+    pub section: Section,
+    pub fire: FireView,
     /// The latest fetch (or the mock), and what the view shows from it at `snap.now`.
     pub data: Data,
     pub snap: Snapshot,
@@ -44,6 +75,9 @@ pub struct State {
     pub results: Option<Receiver<Result<Data, String>>>,
     /// Keeps that thread alive; dropping it stops the thread.
     pub control: Option<Sender<()>>,
+    pub github: Feed<Pulls>,
+    pub linear: Feed<Issues>,
+    pub peek: Option<Peek>,
     pub waker: Option<rune::Waker>,
     /// Scenes pin the clock and the notch so snapshots are reproducible.
     pub frozen: bool,
@@ -75,6 +109,11 @@ pub fn open_settings() {
     });
 }
 
+pub fn open_settings_for(id: &'static str) {
+    SETTINGS.with(|s| if let Some(handle) = s.borrow().as_ref() { handle.update(move |s, _| s.select_id(id)) });
+    open_settings();
+}
+
 /// Quits the app. The panel's × can't use `Tx::quit`: an overlay has no window, and Rune drops
 /// window requests (close, quit) made from one, so the quit goes through the Settings handle.
 pub fn quit() {
@@ -98,26 +137,46 @@ fn init() -> State {
         geo: notch::under_pointer(),
         island: Island::Collapsed,
         seq: Seq::default(),
-        tab: Tab::OnCall,
+        section: Section::FireHydrant,
+        fire: FireView::OnCall,
         snap: Snapshot::build(&data, now()),
         data,
         results: None,
         control: None,
+        github: Feed::new(pulls::mock(now()), mock_read()),
+        linear: Feed::new(issues::mock(now()), mock_read()),
+        peek: None,
         waker: None,
         frozen: false,
         installed: installed::Watch::new(),
     }
 }
 
+/// The mock's read state: counting from long before its events, so some are unread.
+fn mock_read() -> ReadState { ReadState::memory(now() - chrono::Duration::days(30)) }
+
+fn mock_only() -> bool { demo::on() || *MOCK_ONLY.get().unwrap_or(&false) }
+
 /// The overlay's setup: keep the waker and connect.
 fn start_fetching(s: &mut State, wake: rune::Waker) {
     s.waker = Some(wake);
-    connect(s);
+    connect_firehydrant(s);
+    connect_github(s);
+    connect_linear(s);
+}
+
+/// Reconnects one integration after Settings saved it.
+pub fn reconnect(s: &mut State, id: &str) {
+    match id {
+        "github" => connect_github(s),
+        "linear" => connect_linear(s),
+        _ => connect_firehydrant(s),
+    }
 }
 
 /// (Re)connects to FireHydrant with the saved settings, stopping any earlier connection;
-/// without an API key, back to mock data. Called at startup and whenever Settings saves.
-pub fn connect(s: &mut State) {
+/// without an API key, back to mock data.
+fn connect_firehydrant(s: &mut State) {
     s.control = None; // stops the old thread
     s.results = None;
     if demo::on() {
@@ -138,6 +197,103 @@ pub fn connect(s: &mut State) {
         _ => s.data = oncall::mock(&mock_me(), now()),
     }
     s.snap = Snapshot::build(&s.data, now());
+}
+
+/// (Re)connects to GitHub with the saved settings, as `connect_firehydrant` does.
+fn connect_github(s: &mut State) {
+    if s.peek.as_ref().is_some_and(|p| p.section == Section::GitHub) { s.peek = None; }
+    let client = if mock_only() { None } else { github::Client::from_settings() };
+    match (client, s.waker.clone()) {
+        (Some(client), Some(wake)) => s.github.start("github", github::EVERY, client.fetcher(), wake, Pulls::loading(),
+            ReadState::load(pulls::READ_FILE, now())),
+        _ => {
+            let mut pulls = pulls::mock(now());
+            if demo::on() && github::INTEGRATION.configured() { pulls.origin = Origin::Live { at: now() }; }
+            s.github.show(pulls, mock_read());
+        }
+    }
+}
+
+/// Takes in finished GitHub fetches and peeks the newest new event, unless the panel is open.
+fn take_pulls(s: &mut State, clock: f64) -> bool {
+    let gh = &mut s.github;
+    let arrived = gh.take(|read, pulls| read.sync(pulls.list.iter().map(|p| (p.id.as_str(), p.read_on_github)), now()));
+    if !arrived { return false; }
+    let new = gh.announced.update(pulls::unread_events(&gh.data.list, &gh.read));
+    if let (Some((p, a)), false) = (new.into_iter().max_by_key(|(_, a)| a.at), s.island.is_open()) {
+        s.peek = Some(Peek {
+            section: Section::GitHub,
+            who: a.who.clone(),
+            headline: format!("{} on #{}", a.headline(), p.number),
+            detail: if a.excerpt.is_empty() { p.title.clone() } else { a.excerpt.clone() },
+            until: clock + PEEK_SECONDS,
+        });
+    }
+    true
+}
+
+/// (Re)connects to Linear with the saved settings, as `connect_firehydrant` does.
+fn connect_linear(s: &mut State) {
+    if s.peek.as_ref().is_some_and(|p| p.section == Section::Linear) { s.peek = None; }
+    let client = if mock_only() { None } else { linear::Client::from_settings() };
+    match (client, s.waker.clone()) {
+        (Some(client), Some(wake)) => s.linear.start("linear", linear::EVERY, client.fetcher(), wake, Issues::loading(),
+            ReadState::load(issues::READ_FILE, now() - issues::look_back())),
+        _ => {
+            let mut found = issues::mock(now());
+            if demo::on() && linear::INTEGRATION.configured() { found.origin = Origin::Live { at: now() }; }
+            s.linear.show(found, mock_read());
+        }
+    }
+}
+
+/// Takes in finished Linear fetches and peeks the newest new notification, as `take_pulls` does.
+fn take_issues(s: &mut State, clock: f64) -> bool {
+    let ln = &mut s.linear;
+    let arrived = ln.take(|read, found| read.sync(found.list.iter().map(|t| (t.id.as_str(), None)), now()));
+    if !arrived { return false; }
+    let new = ln.announced.update(issues::unread_events(&ln.data.list, &ln.read));
+    if let (Some((t, n)), false) = (new.into_iter().max_by_key(|(_, n)| n.at), s.island.is_open()) {
+        let on = if t.key.is_empty() { t.title.clone() } else { t.key.clone() };
+        s.peek = Some(Peek {
+            section: Section::Linear,
+            who: if n.who.is_empty() { "Linear".into() } else { n.who.clone() },
+            headline: format!("{} on {on}", n.headline),
+            detail: if n.excerpt.is_empty() { t.title.clone() } else { n.excerpt.clone() },
+            until: clock + PEEK_SECONDS,
+        });
+    }
+    true
+}
+
+impl State {
+    /// Opens an issue or project where its oldest unread notification points, and marks it read.
+    pub fn open_ticket(&mut self, id: &str, tx: &mut Tx) {
+        let ln = &mut self.linear;
+        let Some(t) = ln.data.list.iter().find(|t| t.id == id) else { return };
+        let url = t.unread(&ln.read).first().map(|n| n.url.as_str()).filter(|u| !u.is_empty()).unwrap_or(&t.url).to_string();
+        ln.read.mark(id, now());
+        if !url.is_empty() && let Err(e) = tx.open_url(&url) { eprintln!("linear: can't open {url}: {e:?}"); }
+    }
+
+    pub fn mark_issues_read(&mut self) {
+        let ln = &mut self.linear;
+        ln.read.mark_all(ln.data.list.iter().filter_map(|t| Some((t.id.as_str(), t.notices.last()?.at))));
+    }
+
+    /// Opens a pull request where its oldest unread event is, and marks it read.
+    pub fn open_pull(&mut self, id: &str, tx: &mut Tx) {
+        let gh = &mut self.github;
+        let Some(pull) = gh.data.list.iter().find(|p| p.id == id) else { return };
+        let url = pull.unread(&gh.read).first().map_or(pull.url.as_str(), |a| a.url.as_str()).to_string();
+        gh.read.mark(id, now());
+        if !url.is_empty() && let Err(e) = tx.open_url(&url) { eprintln!("github: can't open {url}: {e:?}"); }
+    }
+
+    pub fn mark_pulls_read(&mut self) {
+        let gh = &mut self.github;
+        gh.read.mark_all(gh.data.list.iter().filter_map(|p| Some((p.id.as_str(), p.activity.last()?.at))));
+    }
 }
 
 /// Takes in finished fetches. A failure keeps the last good data and says so.
@@ -186,8 +342,18 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
             tx.wake_at(due);
         }
     }
+    if let Some(peek) = s.peek.as_ref().filter(|_| !s.frozen) {
+        if clock >= peek.until || s.island.is_open() {
+            s.peek = None;
+            changed = true;
+        } else {
+            tx.wake_at(peek.until);
+        }
+    }
     if !s.frozen {
         let t = now();
+        changed |= take_pulls(s, clock);
+        changed |= take_issues(s, clock);
         let fetched = take_results(s);
         if fetched || t.format("%H:%M").to_string() != s.snap.now.format("%H:%M").to_string() {
             s.snap = Snapshot::build(&s.data, t);
@@ -210,6 +376,8 @@ fn freeze(s: &mut State, at: NaiveDateTime) {
     s.geo = NotchGeo { width: 185.0, height: 32.0, real: true };
     s.data = oncall::mock("OP", at);
     s.snap = Snapshot::build(&s.data, at);
+    s.github.show(pulls::mock(at), ReadState::memory(at - chrono::Duration::days(30)));
+    s.linear.show(issues::mock(at), ReadState::memory(at - issues::look_back()));
 }
 
 fn spec() -> AppSpec<State> {
@@ -217,8 +385,16 @@ fn spec() -> AppSpec<State> {
         scenes: &[
             ("collapsed", |s| freeze(s, scene_time(10, 14, 5))),
             ("open", |s| { freeze(s, scene_time(10, 14, 5)); s.island = Island::Open; }),
-            ("incidents", |s| { freeze(s, scene_time(10, 14, 5)); s.island = Island::Open; s.tab = Tab::Incidents; }),
+            ("incidents", |s| { freeze(s, scene_time(10, 14, 5)); s.island = Island::Open; s.fire = FireView::Incidents; }),
             ("offhours", |s| { freeze(s, scene_time(14, 11, 30)); s.island = Island::Open; }),
+            ("pulls", |s| { freeze(s, scene_time(10, 14, 5)); s.island = Island::Open; s.section = Section::GitHub; }),
+            ("linear", |s| { freeze(s, scene_time(10, 14, 5)); s.island = Island::Open; s.section = Section::Linear; }),
+            ("peek", |s| {
+                freeze(s, scene_time(10, 14, 5));
+                let (pull, a) = (&s.github.data.list[0], &s.github.data.list[0].activity[1]);
+                s.peek = Some(Peek { section: Section::GitHub, who: a.who.clone(), headline: format!("{} on #{}", a.headline(), pull.number),
+                    detail: a.excerpt.clone(), until: 0.0 });
+            }),
         ],
         poll: Some(poll),
         ..AppSpec::new("Notch", view::CANVAS, init, view::view)
@@ -252,12 +428,64 @@ fn probe(raw: bool) {
     }
 }
 
+/// `--probe-github` prints your pull requests and their activity, unread marked with *.
+fn probe_github() {
+    let Some(mut client) = github::Client::from_settings() else {
+        eprintln!("No GitHub token: add one in Settings (the gear in the panel) or set NOTCH_GITHUB_TOKEN.");
+        std::process::exit(1);
+    };
+    match client.fetch(now()) {
+        Ok(found) => {
+            let read = ReadState::load(pulls::READ_FILE, now());
+            println!("you are {}: {} pull requests, {} with something unread", found.login, found.list.len(), pulls::unread_count(&found.list, &read));
+            for w in &found.warnings { println!("note: {w}"); }
+            for (p, _) in pulls::shown(&found.list, &read) {
+                let last = read.last_read(&p.id, p.read_on_github);
+                println!("  {}#{} [{:?} · checks {:?} · review {:?}] {}", p.repo, p.number, p.status, p.checks, p.review, p.title);
+                println!("    last read {}{}", last.format("%F %T"), p.read_on_github.map(|t| format!(" (on GitHub {})", t.format("%F %T"))).unwrap_or_default());
+                for a in &p.activity {
+                    println!("    {} {} {}{}", if a.at > last { "*" } else { " " }, a.at, a.headline(), if a.excerpt.is_empty() { String::new() } else { format!(": {}", a.excerpt) });
+                }
+            }
+        }
+        Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+    }
+}
+
+/// `--probe-linear` prints what the Linear section would list, unread notifications marked with *.
+fn probe_linear() {
+    let Some(client) = linear::Client::from_settings() else {
+        eprintln!("No Linear API key: add one in Settings (the gear in the panel) or set NOTCH_LINEAR_API_KEY.");
+        std::process::exit(1);
+    };
+    match client.fetch(now()) {
+        Ok(found) => {
+            let read = ReadState::load(issues::READ_FILE, now() - issues::look_back());
+            let shown = issues::shown(&found.list, &read);
+            println!("you are {}: {} issues and projects, {} listed, {} with something unread", found.me, found.list.len(), shown.len(),
+                issues::unread_count(&found.list, &read));
+            for (t, _) in shown {
+                println!("  {} [{}{}]", t.name(), t.state, if t.assigned { " · yours" } else { "" });
+                let last = read.last_read(&t.id, None);
+                for n in &t.notices {
+                    let unread = !n.read && n.at > last;
+                    println!("    {} {} {}{}", if unread { "*" } else { " " }, n.at.format("%F %T"), n.headline,
+                        if n.excerpt.is_empty() { String::new() } else { format!(": {}", n.excerpt) });
+                }
+            }
+        }
+        Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--login") {
         std::process::exit(login::cli(args.get(i + 1).map(String::as_str)));
     }
     if args.iter().any(|a| a == "--version") { return println!("notch-assistant {}", env!("CARGO_PKG_VERSION")); }
+    if args.iter().any(|a| a == "--probe-github") { return probe_github(); }
+    if args.iter().any(|a| a == "--probe-linear") { return probe_linear(); }
     if args.iter().any(|a| a == "--probe" || a == "--probe-raw") {
         return probe(args.iter().any(|a| a == "--probe-raw"));
     }

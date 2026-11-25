@@ -19,18 +19,22 @@ let display: CGDirectDisplayID = {
     return ids[0..<Int(count)].first { CGDisplayIsBuiltin($0) != 0 } ?? CGMainDisplayID()
 }()
 let bounds = CGDisplayBounds(display)
-let cx = bounds.midX
+let cx = bounds.width / 2
 
-/// The open panel is 660 pt wide, centred; its top bar is the notch's height (32 pt).
+/// The open panel is 800 pt wide, centred; its top bar is the notch's height (32 pt), with the
+/// integrations' sidebar below it on the left.
 /// Settings (src/demo.rs): 680 × 500 pt, its top 380 pt down; content runs under the title bar.
 enum Spot {
     static let desk = CGPoint(x: cx, y: 560)
     static let notch = CGPoint(x: cx, y: 12)
-    static let onCallTab = CGPoint(x: cx - 285, y: 16)
-    static let incidentsTab = CGPoint(x: cx - 210, y: 16)
-    static let connect = CGPoint(x: cx + 165, y: 16)   // "Mock · Connect", right of the notch
-    static let gear = CGPoint(x: cx + 281, y: 16)      // ⚙, beside the clock
-    static let panelWeek = CGPoint(x: cx - 120, y: 240)
+    static let fireHydrant = CGPoint(x: cx - 319, y: 55)  // the sidebar
+    static let gitHub = CGPoint(x: cx - 319, y: 87)
+    static let linear = CGPoint(x: cx - 319, y: 119)
+    static let onCallTab = CGPoint(x: cx - 201, y: 52)    // FireHydrant's switch
+    static let incidentsTab = CGPoint(x: cx - 120, y: 52)
+    static let connect = CGPoint(x: cx - 320, y: 16)      // "Mock data · Connect", left of the notch
+    static let gear = CGPoint(x: cx + 351, y: 16)         // ⚙, beside the clock
+    static let panelWeek = CGPoint(x: cx - 60, y: 270)
     static func settings(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: cx - 340 + x, y: 380 + y) }
     static let apiKey = settings(400, 135)
     static let save = settings(245, 404)
@@ -89,6 +93,9 @@ let tour: [Step] = [
     step(2.8) { move(Spot.incidentsTab, 0.6); click(); wait(2.2) },               // incidents
     step(2.0) { move(Spot.onCallTab, 0.5); click(); wait(1.5) },                  // back to on-call
     step(2.2) { move(Spot.panelWeek, 0.6); wait(1.6) },                           // the rotation strip
+    step(2.8) { move(Spot.gitHub, 0.6); click(); wait(2.2) },                     // your pull requests
+    step(2.8) { move(Spot.linear, 0.4); click(); wait(2.4) },                     // Linear
+    step(1.8) { move(Spot.fireHydrant, 0.4); click(); wait(1.4) },                // back to FireHydrant
     step(2.2) { move(Spot.desk, 0.7); wait(1.5) },                                // leave: it closes
     step(2.0) { move(Spot.notch, 0.8); wait(1.2) },                               // back
     step(2.3) { move(Spot.gear, 0.6); wait(0.4); click(); wait(1.3) },            // ⚙ opens Settings
