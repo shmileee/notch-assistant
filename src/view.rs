@@ -1,20 +1,30 @@
 //! The island: a black shape that hugs the notch while collapsed and springs open into a
-//! panel with tabs. The top strip beside the notch holds the tabs and the clock; the notch
-//! itself hides whatever is drawn behind it, so content starts below it.
+//! panel. Open, a sidebar picks an integration and its data shows beside it. The top strip
+//! beside the notch says where that data comes from and holds the clock; the notch itself
+//! hides whatever is drawn behind it, so content starts below it.
 
-use chrono::Duration;
+use chrono::{Duration, NaiveDateTime};
 use rune::tok::TextStyle;
-use rune::{Color, Cx, El, Spring, Transition, col, el, row, spacer, text};
+use rune::{Color, Cx, El, ScrollSpec, Spring, Transition, Tx, col, el, row, spacer, text};
 
 use crate::island::{self, Event};
-use crate::oncall::{Incident, Origin, Role, Shift, Snapshot, Week, span, when};
-use crate::{State, Tab};
+use crate::oncall::{Incident, Origin, Role, Shift, Snapshot, Week, initials, span, when};
+use crate::issues::{self, Notice, Ticket};
+use crate::pulls::{self, Activity, Checks, Pull, Review, Status};
+use crate::{FireView, Peek, Section, State};
 
-pub const PANEL: (f32, f32) = (660.0, 300.0);
+/// The open panel. The sidebar takes `SIDEBAR` of its width; the rest is the section's.
+pub const PANEL: (f32, f32) = (800.0, 330.0);
+const SIDEBAR: f32 = 150.0;
 /// The overlay canvas: the open panel plus room for its shadow. Only the island takes clicks.
 pub const CANVAS: (f32, f32) = (PANEL.0 + 60.0, PANEL.1 + 40.0);
-/// How far the collapsed island reaches past each side of the notch.
+/// How far the collapsed island reaches past each side of the notch: further for each count of
+/// unread things beside the status dot, further still while it peeks at something new.
 const WING: f32 = 30.0;
+const BADGE_WING: f32 = 24.0;
+const PEEK_WING: f32 = 110.0;
+/// The peek's line under the notch.
+const PEEK_H: f32 = 46.0;
 
 const BLACK: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
 const WHITE: Color = Color::WHITE;
@@ -29,6 +39,8 @@ fn green() -> Color { rgb(0x34d17a) }
 fn amber() -> Color { rgb(0xf5b83d) }
 fn blue() -> Color { rgb(0x3b7cf6) }
 fn red() -> Color { rgb(0xff5a52) }
+fn purple() -> Color { rgb(0xa371f7) }
+fn indigo() -> Color { rgb(0x5e6ad2) }
 
 const SPRING: Spring = Spring::new(0.42, 0.22);
 
@@ -48,10 +60,13 @@ fn avatar(initials: &str, d: f32, ring: Option<Color>) -> El {
 
 pub fn view(s: &State, _: &mut Cx<State>) -> El {
     let open = s.island.is_open();
-    let r = if open { 30.0 } else { s.geo.height * 0.42 };
-    let body = if open { expanded(s) } else { collapsed(s) };
-    // Open, the panel is as tall as its tab's content; the height springs with the width.
-    let shape = if open { col().w(PANEL.0).max_h(PANEL.1) } else { col().size(s.geo.width + 2.0 * WING, s.geo.height) };
+    let peek = s.peek.as_ref().filter(|_| !open);
+    let r = if open { 30.0 } else if peek.is_some() { 22.0 } else { s.geo.height * 0.42 };
+    let body = if open { expanded(s) } else { collapsed(s, peek) };
+    // Open, the panel is as tall as its section's content; the height springs with the width.
+    let wing = if peek.is_some() { PEEK_WING } else { WING + BADGE_WING * alerts(s).len() as f32 };
+    let height = s.geo.height + if peek.is_some() { PEEK_H } else { 0.0 };
+    let shape = if open { col().w(PANEL.0).max_h(PANEL.1) } else { col().size(s.geo.width + 2.0 * wing, height) };
     let island = shape.key("island").hit().fill(BLACK)
         .corners([0.0, 0.0, r, r]).clip_corners([0.0, 0.0, r, r])
         .shadow(10.0, if open { 40.0 } else { 0.0 }, BLACK.alpha(if open { 0.45 } else { 0.0 }))
@@ -59,43 +74,82 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
         .on_hover_change(|s: &mut State, inside, tx| {
             let now = tx.clock();
             let event = if inside { Event::Enter { now } } else { Event::Leave { now } };
+            if let (true, Some(peek)) = (inside, &s.peek) { s.section = peek.section; }
             for e in island::step(&mut s.seq, &mut s.island, event) {
                 match e { island::Effect::WakeAt(due) => tx.wake_at(due) }
             }
         })
-        .on_press(|s: &mut State| { let _ = island::step(&mut s.seq, &mut s.island, Event::Press); })
+        .on_press(|s: &mut State| {
+            if let Some(peek) = &s.peek { s.section = peek.section; }
+            let _ = island::step(&mut s.seq, &mut s.island, Event::Press);
+        })
         .child(body);
     col().w_full().h_full().items_center().child(island)
 }
 
-/// Collapsed: a status dot on the left wing, the current primary on the right.
-fn collapsed(s: &State) -> El {
+fn unread_pulls(s: &State) -> usize { pulls::unread_count(&s.github.data.list, &s.github.read) }
+
+fn unread_issues(s: &State) -> usize { issues::unread_count(&s.linear.data.list, &s.linear.read) }
+
+/// The counts on the collapsed island, one per integration with something unread. None for a
+/// mock, which would otherwise sit there for good on a Mac that never connects it; scenes and
+/// demo mode show the mock's.
+fn alerts(s: &State) -> Vec<(usize, Color)> {
+    let real = |origin: &Origin| *origin != Origin::Mock || crate::sandboxed();
+    let mut counts = vec![];
+    if real(&s.github.data.origin) { counts.push((unread_pulls(s), purple())); }
+    if real(&s.linear.data.origin) { counts.push((unread_issues(s), indigo())); }
+    counts.retain(|(n, _)| *n > 0);
+    counts
+}
+
+fn badge(n: usize, color: Color) -> El {
+    el().h(16.0).min_w(16.0).px(5.0).radius(8.0).fill(color).center().child(label(n.to_string(), 10.0, 700.0, WHITE))
+}
+
+/// Collapsed: a status dot on the left wing with the counts of unread things, the current
+/// primary on the right. A peek adds a line under the notch.
+fn collapsed(s: &State, peek: Option<&Peek>) -> El {
     let snap = &s.snap;
     let dot = match (&snap.mine_now, &snap.primary) {
         (Some(mine), _) => role_color(mine.role),
         (None, Some(_)) => WHITE.alpha(0.35),
         (None, None) => WHITE.alpha(0.15),
     };
-    let left = el().size(8.0, 8.0).radius(4.0).fill(dot);
+    let mut left = row().gap(6.0).items_center().child(el().size(8.0, 8.0).radius(4.0).fill(dot));
+    for (n, color) in alerts(s) { left = left.child(badge(n, color)); }
     let right = match &snap.primary {
         Some(p) => avatar(&p.who, 18.0, None),
         None => el().size(18.0, 18.0),
     };
-    row().key("collapsed").w_full().h_full().px(10.0).items_center().justify_between()
-        .transition(Transition::opacity())
-        .child(left).child(right)
+    let top = row().w_full().h(s.geo.height).px(10.0).items_center().justify_between().child(left).child(right);
+    let mut c = col().key("collapsed").w_full().h_full().transition(Transition::opacity()).child(top);
+    if let Some(peek) = peek {
+        c = c.child(row().key("peek").w_full().h(PEEK_H).px(16.0).pb(6.0).gap(10.0).items_center()
+            .child(avatar(&initials(&peek.who), 26.0, None))
+            .child(col().grow(1.0).min_w(0.0).gap(2.0)
+                .child(label(&peek.headline, 12.5, 600.0, WHITE).truncate())
+                .child(label(&peek.detail, 11.5, 500.0, dim()).truncate())));
+    }
+    c
 }
 
 fn expanded(s: &State) -> El {
-    let body = match (&s.snap.origin, s.tab) {
-        (Origin::Loading, _) => notice("Loading from FireHydrant…", None),
-        (Origin::Error { message, stale: None }, _) => notice("Couldn't reach FireHydrant", Some(message)),
-        (_, Tab::OnCall) => oncall(s),
-        (_, Tab::Incidents) => incidents(s),
+    let (origin, service, _) = source(s, s.section);
+    let body = match origin {
+        Origin::Loading => notice(&format!("Loading from {service}…"), None),
+        Origin::Error { message, stale: None } => notice(&format!("Couldn't reach {service}"), Some(message)),
+        _ => match s.section {
+            Section::FireHydrant => fire(s),
+            Section::GitHub => pull_list(s),
+            Section::Linear => ticket_list(s),
+        },
     };
     col().key("expanded").w_full().transition(Transition::blur_replace())
         .child(top_bar(s))
-        .child(col().key(tab_key(s.tab)).w_full().px(18.0).pt(8.0).pb(18.0).child(body))
+        .child(row().w_full().pb(18.0)
+            .child(sidebar(s))
+            .child(col().key(body_key(s)).grow(1.0).min_w(0.0).px(18.0).pt(8.0).child(body)))
 }
 
 fn notice(title: &str, detail: Option<&str>) -> El {
@@ -104,72 +158,124 @@ fn notice(title: &str, detail: Option<&str>) -> El {
     c
 }
 
-/// Where the data comes from, so mock or stale data is never mistaken for live. `compact`
-/// beside a real notch, where the strip is narrow.
-fn origin_label(snap: &Snapshot, compact: bool) -> El {
-    let (text, color) = match &snap.origin {
-        Origin::Mock => ((if compact { "Mock · Connect" } else { "Mock data · Connect" }).to_string(), amber()),
-        Origin::Loading => ("Loading…".to_string(), dim()),
-        // It refreshes every 5 minutes, so the age only matters once a refresh was missed.
-        Origin::Live { at } if snap.now - *at < Duration::minutes(10) => ("Live".to_string(), green()),
-        Origin::Live { at } => (format!("Live · {} ago", span(snap.now - *at)), green()),
-        Origin::Error { stale: Some(at), .. } => (format!("Offline · {} old", span(snap.now - *at)), red()),
-        Origin::Error { stale: None, .. } => ("Offline".to_string(), red()),
+/// A section's data source: its origin, the service's name and its integration's ID.
+fn source(s: &State, section: Section) -> (&Origin, &'static str, &'static str) {
+    match section {
+        Section::FireHydrant => (&s.snap.origin, "FireHydrant", crate::firehydrant::INTEGRATION.id),
+        Section::GitHub => (&s.github.data.origin, "GitHub", crate::github::INTEGRATION.id),
+        Section::Linear => (&s.linear.data.origin, "Linear", crate::linear::INTEGRATION.id),
+    }
+}
+
+fn origin_color(origin: &Origin) -> Color {
+    match origin {
+        Origin::Mock => amber(),
+        Origin::Loading => dim(),
+        Origin::Live { .. } => green(),
+        Origin::Error { .. } => red(),
+    }
+}
+
+/// Where the selected section's data comes from, so mock or stale data is never mistaken for
+/// live.
+fn origin_label(s: &State) -> El {
+    let (origin, _, id) = source(s, s.section);
+    let now = s.snap.now;
+    let text = match origin {
+        Origin::Mock => "Mock data · Connect".to_string(),
+        Origin::Loading => "Loading…".to_string(),
+        // Each refreshes every five minutes or sooner, so the age only matters once a refresh was missed.
+        Origin::Live { at } if now - *at < Duration::minutes(10) => "Live".to_string(),
+        Origin::Live { at } => format!("Live · {} ago", span(now - *at)),
+        Origin::Error { stale: Some(at), .. } => format!("Offline · {} old", span(now - *at)),
+        Origin::Error { stale: None, .. } => "Offline".to_string(),
     };
     let mut l = row().key("origin").shrink().gap(5.0).items_center().px(6.0).h(20.0).radius(10.0)
-        .child(el().size(6.0, 6.0).radius(3.0).fill(color))
+        .child(el().size(6.0, 6.0).radius(3.0).fill(origin_color(origin)))
         .child(label(text, 11.0, 500.0, dim()).shrink().truncate());
     // Mock or failing: a click opens Settings to connect.
-    if matches!(snap.origin, Origin::Mock | Origin::Error { .. }) {
-        l = l.hit().hover(WHITE.alpha(0.1)).on_press(|_: &mut State| crate::open_settings());
+    if matches!(origin, Origin::Mock | Origin::Error { .. }) {
+        l = l.hit().hover(WHITE.alpha(0.1)).on_press(move |_: &mut State| crate::open_settings_for(id));
     }
     l
 }
 
-fn tab_key(tab: Tab) -> &'static str { match tab { Tab::OnCall => "tab-oncall", Tab::Incidents => "tab-incidents" } }
+fn body_key(s: &State) -> &'static str {
+    match (s.section, s.fire) {
+        (Section::FireHydrant, FireView::OnCall) => "body-oncall",
+        (Section::FireHydrant, FireView::Incidents) => "body-incidents",
+        (Section::GitHub, _) => "body-github",
+        (Section::Linear, _) => "body-linear",
+    }
+}
+
+fn sidebar(s: &State) -> El {
+    let item = |section: Section, key: &'static str, count: usize, color: Color| {
+        let (origin, name, _) = source(s, section);
+        let on = s.section == section;
+        let mut r = row().key(key).hit().w_full().h(30.0).px(10.0).gap(8.0).items_center().radius(10.0)
+            .fill(WHITE.alpha(if on { 0.12 } else { 0.0 })).hover(WHITE.alpha(0.07))
+            .on_press(move |s: &mut State| s.section = section)
+            .child(el().size(6.0, 6.0).radius(3.0).fill(origin_color(origin)))
+            .child(label(name, 12.5, if on { 600.0 } else { 500.0 }, if on { WHITE } else { dim() }))
+            .child(spacer());
+        if count > 0 { r = r.child(badge(count, color)); }
+        r
+    };
+    col().w(SIDEBAR).pl(12.0).pt(8.0).gap(2.0)
+        .child(item(Section::FireHydrant, "nav-firehydrant", s.snap.incidents.len(), red()))
+        .child(item(Section::GitHub, "nav-github", unread_pulls(s), purple()))
+        .child(item(Section::Linear, "nav-linear", unread_issues(s), indigo()))
+}
 
 /// Space kept clear on each side of a real notch.
 const NOTCH_MARGIN: f32 = 10.0;
 
-/// The strip beside the notch: tabs on the left wing, the clock on the right.
+/// The strip beside the notch: where the data comes from on the left wing, the clock on the
+/// right.
 ///
 /// A real notch hides whatever is drawn under it (screenshots still show it, the display
-/// doesn't), so there the strip is two wings with the notch's width kept empty between them,
-/// and the right wing shortens its text to fit. A virtual notch hides nothing.
+/// doesn't), so there the strip is two wings with the notch's width kept empty between them.
+/// A virtual notch hides nothing.
 fn top_bar(s: &State) -> El {
-    let tab = |tab: Tab, name: &'static str, badge: Option<usize>| {
-        let on = s.tab == tab;
-        let mut chip = row().key(tab_key(tab)).hit().gap(6.0).items_center().px(10.0).h(24.0).radius(12.0)
-            .fill(if on { WHITE.alpha(0.14) } else { WHITE.alpha(0.0) }).hover(WHITE.alpha(0.08))
-            .on_press(move |s: &mut State| s.tab = tab)
-            .child(label(name, 12.0, if on { 600.0 } else { 500.0 }, if on { WHITE } else { dim() }));
-        if let Some(n) = badge.filter(|n| *n > 0) {
-            chip = chip.child(el().h(16.0).min_w(16.0).px(5.0).radius(8.0).fill(red()).center().child(label(n.to_string(), 10.0, 700.0, WHITE)));
-        }
-        chip
-    };
     let gear = el().key("settings").hit().size(22.0, 22.0).radius(11.0).center().hover(WHITE.alpha(0.12))
         .on_press(|_: &mut State| crate::open_settings())
         .child(label("⚙", 13.0, 500.0, WHITE.alpha(0.55)));
     let quit = el().key("quit").hit().size(22.0, 22.0).radius(11.0).center().hover(WHITE.alpha(0.12))
         .on_press(|_: &mut State| crate::quit())
         .child(label("×", 14.0, 500.0, WHITE.alpha(0.4)));
-    let real = s.geo.real;
-    let clock = label(s.snap.now.format(if real { "%H:%M" } else { "%a %-d %b  %H:%M" }).to_string(), 12.0, 600.0, WHITE);
-    let tabs = row().gap(2.0).child(tab(Tab::OnCall, "On-call", None)).child(tab(Tab::Incidents, "Incidents", Some(s.snap.incidents.len())));
-    let status = row().shrink().gap(10.0).items_center()
-        .child(origin_label(&s.snap, real)).child(clock).child(row().gap(2.0).child(gear).child(quit));
+    let clock = label(s.snap.now.format("%a %-d %b  %H:%M").to_string(), 12.0, 600.0, WHITE);
+    let right = row().gap(10.0).items_center().child(clock).child(row().gap(2.0).child(gear).child(quit));
     let (pad, bar) = (14.0, row().w_full().h(s.geo.height.max(30.0)).items_center());
-    if !real {
-        return bar.px(pad).child(tabs).child(spacer()).child(status);
+    if !s.geo.real {
+        return bar.px(pad).child(origin_label(s)).child(spacer()).child(right);
     }
     // Wings and the gap add up to the panel's width; each wing clips what doesn't fit.
     let gap = s.geo.width + 2.0 * NOTCH_MARGIN;
     let wing = ((PANEL.0 - gap) / 2.0 - pad).max(0.0);
     bar.px(pad)
-        .child(row().key("wing-left").w(wing).items_center().clip_rounded(0.0).child(tabs))
+        .child(row().key("wing-left").w(wing).items_center().clip_rounded(0.0).child(origin_label(s)))
         .child(el().key("notch-gap").w(gap))
-        .child(row().key("wing-right").w(wing).items_center().justify_end().clip_rounded(0.0).child(status))
+        .child(row().key("wing-right").w(wing).items_center().justify_end().clip_rounded(0.0).child(right))
+}
+
+fn fire(s: &State) -> El {
+    let chip = |view: FireView, key: &'static str, name: &'static str, count: usize| {
+        let on = s.fire == view;
+        let mut chip = row().key(key).hit().gap(5.0).items_center().px(10.0).h(24.0).radius(12.0)
+            .fill(WHITE.alpha(if on { 0.14 } else { 0.0 })).hover(WHITE.alpha(0.08))
+            .on_press(move |s: &mut State| s.fire = view)
+            .child(label(name, 12.0, if on { 600.0 } else { 500.0 }, if on { WHITE } else { dim() }));
+        if count > 0 { chip = chip.child(badge(count, red())); }
+        chip
+    };
+    let switch = row().gap(2.0)
+        .child(chip(FireView::OnCall, "view-oncall", "On-call", 0))
+        .child(chip(FireView::Incidents, "view-incidents", "Incidents", s.snap.incidents.len()));
+    col().w_full().gap(10.0).child(switch).child(match s.fire {
+        FireView::OnCall => oncall(s),
+        FireView::Incidents => incidents(s),
+    })
 }
 
 fn card() -> El { col().radius(16.0).fill(WHITE.alpha(0.07)).padding(14.0).gap(10.0) }
@@ -307,4 +413,106 @@ fn incident(inc: &Incident, age: Duration, me: &str) -> El {
             Some((initials, id)) => avatar(initials, 24.0, (id == me).then_some(WHITE)),
             None => el().size(24.0, 24.0),
         })
+}
+
+/// Rows of an unread list, and the most it shows before it scrolls.
+const ROW: f32 = 46.0;
+const ROW_GAP: f32 = 6.0;
+const ROWS: usize = 4;
+
+fn unread_list(key: &'static str, title: &str, unread: usize, mark_all: fn(&mut State), rows: Vec<El>, empty: &str) -> El {
+    let mut header = row().w_full().h(22.0).items_center()
+        .child(caps(&if unread > 0 { format!("{title} · {unread} unread") } else { title.to_string() }))
+        .child(spacer());
+    if unread > 0 {
+        header = header.child(row().key("mark-all-read").hit().px(9.0).h(22.0).radius(11.0).items_center().hover(WHITE.alpha(0.12))
+            .on_press(mark_all)
+            .child(label("Mark all read", 11.0, 600.0, dim())));
+    }
+    let count = rows.len();
+    let mut list = col().w_full().gap(ROW_GAP);
+    if rows.is_empty() { list = list.child(label(empty, 13.0, 500.0, dim())); }
+    for r in rows { list = list.child(r); }
+    let shown = count.min(ROWS) as f32;
+    let height = (shown * ROW + (shown - 1.0).max(0.0) * ROW_GAP).max(20.0);
+    let list = if count > ROWS {
+        col().key(key).w_full().h(height).scroll(ScrollSpec { stick_bottom: false }).scroll_edge_fade(10.0).child(list)
+    } else { list };
+    col().w_full().gap(8.0).child(header).child(list)
+}
+
+fn list_row(key: String, unread: usize, color: Color, title: &str, detail: String, right: El, open: impl Fn(&mut State, &mut Tx) + 'static) -> El {
+    let new = unread > 0;
+    let marker = if new { badge(unread, color) } else { el().size(16.0, 16.0) };
+    row().key(key).hit().w_full().h(ROW).gap(10.0).items_center().px(12.0).radius(12.0)
+        .fill(WHITE.alpha(if new { 0.1 } else { 0.05 })).hover(WHITE.alpha(0.15))
+        .on_press_tx(open)
+        .child(marker)
+        .child(col().grow(1.0).min_w(0.0).gap(3.0)
+            .child(label(title, 13.0, 600.0, if new { WHITE } else { WHITE.alpha(0.8) }).truncate())
+            .child(label(detail, 11.5, 500.0, if new { WHITE.alpha(0.7) } else { dim() }).truncate()))
+        .child(right)
+}
+
+fn chip(text: &str, color: Color) -> El {
+    row().px(8.0).h(20.0).radius(10.0).items_center().fill(color.alpha(0.18)).child(label(text, 11.0, 600.0, color))
+}
+
+/// Your pull requests, unread first. A click opens one at its oldest unread event and marks it
+/// read.
+fn pull_list(s: &State) -> El {
+    let gh = &s.github;
+    let rows = pulls::shown(&gh.data.list, &gh.read).into_iter().map(|(p, unread)| pull_row(p, &unread, s.snap.now)).collect();
+    unread_list("list-github", "Your pull requests", unread_pulls(s), State::mark_pulls_read, rows, "No open pull requests")
+}
+
+fn pull_row(p: &Pull, unread: &[&Activity], now: NaiveDateTime) -> El {
+    let repo = p.repo.rsplit('/').next().unwrap_or(&p.repo);
+    let detail = match unread.last() {
+        Some(a) => {
+            let what = format!("{} · {} ago", a.headline(), span(now - a.at));
+            if a.excerpt.is_empty() { what } else { format!("{what}: {}", a.excerpt) }
+        }
+        None => format!("{repo} #{} · updated {} ago", p.number, span(now - p.updated)),
+    };
+    let (state, color) = match (p.status, p.review) {
+        (Status::Merged, _) => ("Merged", purple()),
+        (Status::Closed, _) => ("Closed", red()),
+        (Status::Draft, _) => ("Draft", dim()),
+        (_, Review::Approved) => ("Approved", green()),
+        (_, Review::ChangesRequested) => ("Changes", rgb(0xff8a3d)),
+        _ => ("Open", dim()),
+    };
+    let mut right = row().gap(8.0).items_center();
+    match p.checks {
+        Checks::Passing => right = right.child(label("✓", 12.0, 700.0, green())),
+        Checks::Failing => right = right.child(label("✕", 12.0, 700.0, red())),
+        Checks::Pending => right = right.child(el().size(7.0, 7.0).radius(3.5).fill(amber())),
+        Checks::None => {}
+    }
+    let id = p.id.clone();
+    list_row(format!("pull-{}", p.id), unread.len(), purple(), &p.title, detail, right.child(chip(state, color)),
+        move |s: &mut State, tx: &mut Tx| s.open_pull(&id, tx))
+}
+
+/// Linear: issues and projects with unread notifications, then your open issues. A click opens
+/// one where its oldest unread notification points and marks it read.
+fn ticket_list(s: &State) -> El {
+    let ln = &s.linear;
+    let rows = issues::shown(&ln.data.list, &ln.read).into_iter().map(|(t, unread)| ticket_row(t, &unread, s.snap.now)).collect();
+    unread_list("list-linear", "Linear", unread_issues(s), State::mark_issues_read, rows, "No open issues and nothing new")
+}
+
+fn ticket_row(t: &Ticket, unread: &[&Notice], now: NaiveDateTime) -> El {
+    let detail = match unread.last() {
+        Some(n) => {
+            let what = format!("{} · {} ago", n.headline, span(now - n.at));
+            if n.excerpt.is_empty() { what } else { format!("{what}: {}", n.excerpt) }
+        }
+        None if t.assigned => format!("Assigned to you · updated {} ago", span(now - t.updated)),
+        None => format!("Updated {} ago", span(now - t.updated)),
+    };
+    let id = t.id.clone();
+    list_row(format!("ticket-{}", t.id), unread.len(), indigo(), &t.name(), detail, chip(&t.state, rgb(t.color)),
+        move |s: &mut State, tx: &mut Tx| s.open_ticket(&id, tx))
 }

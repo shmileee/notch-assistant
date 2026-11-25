@@ -41,7 +41,7 @@ pub struct Integration {
     pub legacy: &'static [(&'static str, &'static str)],
 }
 
-pub const ALL: &[&Integration] = &[&crate::firehydrant::INTEGRATION];
+pub const ALL: &[&Integration] = &[&crate::firehydrant::INTEGRATION, &crate::github::INTEGRATION, &crate::linear::INTEGRATION];
 
 impl Integration {
     pub fn field(&self, key: &str) -> &Field {

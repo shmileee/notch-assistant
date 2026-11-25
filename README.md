@@ -1,9 +1,10 @@
 # Notch Assistant
 
 A Dynamic-Island-style panel for the MacBook notch that shows your FireHydrant on-call rotation and
-incidents, built with [Rune](https://github.com/anomalyco/rune). Hover the notch and it springs open; move
-away and it closes after a short grace period. On an external display it sits in the middle of the menu
-bar as a "virtual notch".
+incidents, what others did on your GitHub pull requests, and your Linear issues and notifications, built
+with [Rune](https://github.com/anomalyco/rune). Hover the notch and it springs open; move away and it closes
+after a short grace period. On an external display it sits in the middle of the menu bar as a "virtual
+notch".
 
 ![Open panel](snaps/open.png)
 
@@ -13,15 +14,29 @@ bar as a "virtual notch".
 | --- | --- | --- |
 | ![](snaps/collapsed.png) | ![](snaps/incidents.png) | ![](snaps/offhours.png) |
 
+| GitHub | Linear | Something new |
+| --- | --- | --- |
+| ![](snaps/pulls.png) | ![](snaps/linear.png) | ![](snaps/peek.png) |
+
 ## What it shows
 
-- **On-call:** who is primary and secondary now, your current shift with time left, your next shift, and
-  a five-week rotation strip like FireHydrant's month view.
-- **Incidents:** the team's open incidents with severity, status, age and commander.
-- **Collapsed:** a dot left of the notch (green: you're primary, amber: secondary, grey: off call) and the
-  current primary's avatar on the right.
+The open panel has a sidebar of integrations, each with its count; pick one and its data shows beside it.
 
-Until it's connected it shows mock data, labelled "Mock data · Connect" in the panel.
+- **FireHydrant**, with a switch between:
+  - **On-call:** who is primary and secondary now, your current shift with time left, your next shift,
+    and a five-week rotation strip like FireHydrant's month view.
+  - **Incidents:** the team's open incidents with severity, status, age and commander.
+- **GitHub:** your open pull requests, unread first: who commented, reviewed, reacted to your comment or
+  merged it since you last looked, with checks and review state.
+- **Linear:** issues and projects with notifications you haven't read (mentions, comments, status
+  changes, assignments, SLA breaches), then your open issues.
+- **Collapsed:** a dot left of the notch (green: you're primary, amber: secondary, grey: off call), a count
+  beside it for each integration with something unread (purple: GitHub, indigo: Linear), and the current
+  primary's avatar on the right. When something new arrives, the island drops a line under the notch for
+  six seconds saying what; hovering it opens that integration.
+
+In GitHub and Linear, a click opens the item where the unread part starts and marks it read. Until an
+integration is connected, it shows mock data, labelled "Mock data · Connect" in the panel.
 
 ## Install
 
@@ -40,7 +55,8 @@ make uninstall     # stops it and removes the app and the login item (settings a
 
 `INSTALL_DIR=/Applications` installs it for every user; `LOGIN=0` skips open at login.
 
-Then open the panel, click ⚙, and add your FireHydrant API key and team ID (see [FireHydrant](#firehydrant)).
+Then open the panel, click ⚙, and add your FireHydrant API key and team ID (see [FireHydrant](#firehydrant)),
+a GitHub token and a Linear API key (see [GitHub and Linear](#github-and-linear)).
 
 - **Quitting:** the × in the open panel, or ⌘Q while Settings is in front.
 - **Open at login:** a switch at the bottom left of Settings, also in System Settings › General › Login
@@ -75,12 +91,21 @@ FireHydrant user ID), else this Mac account's full name. It makes three read-onl
 To check what it reads without launching the app: `cargo run --release -- --probe` (`--probe-raw` dumps
 the JSON).
 
+## GitHub and Linear
+
+Each needs one secret in Settings: a classic GitHub token with the `repo` scope, and a Linear API key with
+Read access. Both are read-only, and both count something as unread until you read it in the panel or on
+the service. How to create them, what counts, and what each one calls:
+
+- [docs/github.md](docs/github.md)
+- [docs/linear.md](docs/linear.md)
+
 ## Development
 
 ```sh
 cargo run --release                                        # run it (stop the installed copy first)
 cargo test
-cargo run -- --scene open --snap snaps/open.png           # scenes: collapsed, open, incidents, offhours
+cargo run -- --scene open --snap snaps/open.png           # scenes: collapsed, open, incidents, offhours, pulls, linear, peek
 cargo run -- --scene collapsed --script scripts/hover.json --snap mid.png --at 0.75
 ```
 
@@ -109,9 +134,15 @@ proposes the cask update. `make icon` redraws `assets/AppIcon.icns`.
 | `src/main.rs` | App setup: a transparent overlay at the top of the display under the pointer, where only the island takes clicks. Also the timers, the minute refresh and the snapshot scenes. |
 | `src/notch.rs` | The notch of the current display (`NSScreen.safeAreaInsets`), or a virtual 185-pt one as tall as the menu bar. |
 | `src/island.rs` | The hover state machine: `Collapsed → Arming (120 ms) → Open → Closing (400 ms)`, so a passing pointer doesn't open it. |
-| `src/view.rs` | The island and its tabs. Beside a real notch, the top bar keeps clear of it. |
+| `src/view.rs` | The island, and the open panel's sidebar and sections. Beside a real notch, the top bar keeps clear of it. |
 | `src/oncall.rs` | The `OnCallSource` trait, the mock, and the `Snapshot` the view renders. |
 | `src/firehydrant.rs` | The FireHydrant client, its integration declaration and its refresh thread. |
+| `src/pulls.rs` | Pull requests and their activity, and the mock. |
+| `src/github.rs` | The GitHub client and its integration declaration. |
+| `src/issues.rs` | Linear issues, projects and notifications, and the mock. |
+| `src/linear.rs` | The Linear client and its integration declaration. |
+| `src/feed.rs` | A notifying integration's data, read state and refresh thread. |
+| `src/read.rs` | What you've read of each, and which unread events are new since the last refresh. |
 | `src/integrations.rs` | The integration registry: each one's fields (`Secret` or `Text`), env overrides and connection test. |
 | `src/store.rs` | Secrets in the Keychain (written via `security -i`, never on a command line), the rest in settings.json. |
 | `src/settings.rs` | The Settings window, built from the registry. |
@@ -122,7 +153,8 @@ proposes the cask update. `make icon` redraws `assets/AppIcon.icns`.
 
 **Adding an integration.** Declare an `Integration` (fields, required secret, test) and add it to
 `integrations::ALL`; it appears in Settings, and its values come from `integration.value(key)`. Fetch its
-data on a worker thread as `firehydrant::spawn` does, give it a tab or card, and add a mock so scenes and
+data on a worker thread: a `feed::Feed` does that, keeps read state and spots new events, as GitHub and
+Linear use it. Give it a `Section` (its sidebar entry and view in `view.rs`) and add a mock so scenes and
 demo mode keep working. Another kind of sign-in (OAuth, say) is a new `FieldKind` with its own control in
 `settings.rs`.
 

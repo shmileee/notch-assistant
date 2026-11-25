@@ -6,6 +6,8 @@
 //!   pass the secret on stdin (`security -i`), never on a command line other processes can see.
 //! - Everything else goes in `~/Library/Application Support/notch-assistant/settings.json`, as
 //!   `{ "<integration>": { "<field>": "value" } }`.
+//! - What the app keeps track of by itself (what you've read, say) goes in its own JSON file
+//!   in the same folder (`state`, `set_state`).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -77,8 +79,23 @@ pub fn delete_legacy(service: &str) {
         .stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
-fn settings_path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/notch-assistant/settings.json"))
+fn path(file: &str) -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/notch-assistant").join(file))
+}
+
+fn settings_path() -> Option<PathBuf> { path("settings.json") }
+
+/// `<name>.json`, as the app last saved it.
+pub fn state(name: &str) -> Option<Value> {
+    if let Some(v) = memory(|m| m.get(&format!("state:{name}")).cloned()) { return v.and_then(|s| serde_json::from_str(&s).ok()); }
+    serde_json::from_slice(&std::fs::read(path(&format!("{name}.json"))?).ok()?).ok()
+}
+
+pub fn set_state(name: &str, value: &Value) -> Result<(), String> {
+    if memory(|m| m.insert(format!("state:{name}"), value.to_string())).is_some() { return Ok(()); }
+    let path = path(&format!("{name}.json")).ok_or("no home folder")?;
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(&path, serde_json::to_vec_pretty(value).unwrap()).map_err(|e| e.to_string())
 }
 
 fn load() -> Map<String, Value> {
