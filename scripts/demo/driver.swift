@@ -19,7 +19,7 @@ let display: CGDirectDisplayID = {
     return ids[0..<Int(count)].first { CGDisplayIsBuiltin($0) != 0 } ?? CGMainDisplayID()
 }()
 let bounds = CGDisplayBounds(display)
-let cx = bounds.midX
+let cx = bounds.width / 2
 
 /// The open panel is 800 pt wide, centred; its top bar is the notch's height (32 pt), with the
 /// integrations' sidebar below it on the left.
