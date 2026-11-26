@@ -7,8 +7,13 @@
 // Positions come from the app's layout (src/view.rs, src/settings.rs) and the demo constants in
 // src/demo.rs. When the UI changes, update `Spot` below and add steps to `tour`.
 
+import AppKit
 import CoreGraphics
 import Foundation
+
+/// The app being recorded (record-demo.sh sets it). Keys go to it alone: posted to the system
+/// they reach whatever app is in front, which needn't be this one.
+let app = ProcessInfo.processInfo.environment["NOTCH_DEMO_PID"].flatMap { pid_t($0) }
 
 // MARK: - Where things are, in points from the built-in display's top-left
 
@@ -32,6 +37,7 @@ enum Spot {
     static let linear = CGPoint(x: cx - 319, y: 119)
     static let onCallTab = CGPoint(x: cx - 201, y: 52)    // FireHydrant's switch
     static let incidentsTab = CGPoint(x: cx - 120, y: 52)
+    static let reviewsTab = CGPoint(x: cx - 35, y: 52)     // GitHub's switch
     static let connect = CGPoint(x: cx - 320, y: 16)      // "Mock data · Connect", left of the notch
     static let gear = CGPoint(x: cx + 351, y: 16)         // ⚙, beside the clock
     static let panelWeek = CGPoint(x: cx - 60, y: 270)
@@ -69,12 +75,17 @@ func click() {
 }
 
 func type(_ text: String, every seconds: Double = 0.045) {
+    guard let app else {
+        FileHandle.standardError.write("NOTCH_DEMO_PID isn't set: not typing\n".data(using: .utf8)!)
+        return
+    }
+    NSRunningApplication(processIdentifier: app)?.activate()
     for ch in text {
         var units = Array(String(ch).utf16)
         for down in [true, false] {
             let e = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: down)
             e?.keyboardSetUnicodeString(stringLength: units.count, unicodeString: &units)
-            e?.post(tap: .cghidEventTap)
+            e?.postToPid(app)
         }
         usleep(useconds_t(seconds * 1_000_000))
     }
@@ -94,6 +105,7 @@ let tour: [Step] = [
     step(2.0) { move(Spot.onCallTab, 0.5); click(); wait(1.5) },                  // back to on-call
     step(2.2) { move(Spot.panelWeek, 0.6); wait(1.6) },                           // the rotation strip
     step(2.8) { move(Spot.gitHub, 0.6); click(); wait(2.2) },                     // your pull requests
+    step(2.8) { move(Spot.reviewsTab, 0.5); click(); wait(2.3) },                 // the ones to review
     step(2.8) { move(Spot.linear, 0.4); click(); wait(2.4) },                     // Linear
     step(1.8) { move(Spot.fireHydrant, 0.4); click(); wait(1.4) },                // back to FireHydrant
     step(2.2) { move(Spot.desk, 0.7); wait(1.5) },                                // leave: it closes

@@ -31,7 +31,7 @@ echo "Recording display $index for ${seconds}s. Hands off the mouse and keyboard
 screencapture -v -C -k -x -D"$index" -V"$seconds" "$work/raw.mov" &
 recorder=$!
 sleep 1
-target/demo-driver
+NOTCH_DEMO_PID=$app target/demo-driver
 wait "$recorder"
 
 kill "$app" 2>/dev/null || true
