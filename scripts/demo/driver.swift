@@ -35,6 +35,8 @@ enum Spot {
     static let fireHydrant = CGPoint(x: cx - 319, y: 55)  // the sidebar
     static let gitHub = CGPoint(x: cx - 319, y: 87)
     static let linear = CGPoint(x: cx - 319, y: 119)
+    static let calendar = CGPoint(x: cx - 319, y: 151)
+    static let join = CGPoint(x: cx - 107, y: 194)       // the Calendar section's Join button
     static let onCallTab = CGPoint(x: cx - 201, y: 52)    // FireHydrant's switch
     static let incidentsTab = CGPoint(x: cx - 120, y: 52)
     static let reviewsTab = CGPoint(x: cx - 35, y: 52)     // GitHub's switch
@@ -44,6 +46,8 @@ enum Spot {
     static func settings(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: cx - 340 + x, y: 380 + y) }
     static let apiKey = settings(400, 135)
     static let save = settings(245, 404)
+    static let settingsCalendar = settings(110, 172)
+    static let allow = settings(270, 171)
     static let belowSettings = CGPoint(x: cx + 420, y: 700)
 }
 
@@ -107,12 +111,16 @@ let tour: [Step] = [
     step(2.8) { move(Spot.gitHub, 0.6); click(); wait(2.2) },                     // your pull requests
     step(2.8) { move(Spot.reviewsTab, 0.5); click(); wait(2.3) },                 // the ones to review
     step(2.8) { move(Spot.linear, 0.4); click(); wait(2.4) },                     // Linear
+    step(3.0) { move(Spot.calendar, 0.4); click(); wait(2.6) },                   // Calendar
+    step(2.0) { move(Spot.join, 0.6); wait(1.4) },                                // the Join button
     step(1.8) { move(Spot.fireHydrant, 0.4); click(); wait(1.4) },                // back to FireHydrant
     step(2.2) { move(Spot.desk, 0.7); wait(1.5) },                                // leave: it closes
     step(2.0) { move(Spot.notch, 0.8); wait(1.2) },                               // back
     step(2.3) { move(Spot.gear, 0.6); wait(0.4); click(); wait(1.3) },            // ⚙ opens Settings
     step(3.4) { move(Spot.apiKey, 0.8); click(); wait(0.4); type("fhb-demo-7c1e9a2b4d6f8e0a3b5c"); wait(0.8) },
     step(3.6) { move(Spot.save, 0.6); click(); wait(3.0) },                       // save, test passes
+    step(1.8) { move(Spot.settingsCalendar, 0.6); click(); wait(1.2) },           // Settings › Calendar
+    step(3.6) { move(Spot.allow, 0.5); click(); wait(3.1) },                      // allow access, test passes
     step(3.6) { move(Spot.notch, 1.0); wait(2.6) },                               // the panel now says Live
     step(2.0) { move(Spot.belowSettings, 0.8); wait(1.2) },                       // done
 ]

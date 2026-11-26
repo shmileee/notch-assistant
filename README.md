@@ -8,7 +8,7 @@ notch".
 
 ![Open panel](snaps/open.png)
 
-**Demo video:** [demo/notch-assistant.mp4](demo/notch-assistant.mp4) (43 s: hover, each integration in the sidebar and the pull requests to review, Settings, connecting).
+**Demo video:** [demo/notch-assistant.mp4](demo/notch-assistant.mp4) (53 s: hover, each integration in the sidebar, the pull requests to review and the Calendar section, Settings, connecting and allowing calendar access).
 
 | Collapsed | Something new | Incidents | Off hours |
 | --- | --- | --- | --- |
@@ -134,7 +134,7 @@ it (default `OP`).
 **Recording the demo video.** `scripts/record-demo.sh` writes `demo/notch-assistant.mp4`. It runs the app
 in demo mode (`NOTCH_DEMO=1`: mock data, settings in memory, a simulated connection test, a backdrop over
 the desktop) and records the MacBook display while `scripts/demo/driver.swift` drives the pointer and
-keyboard. Keep hands off for ~35 s. It needs Screen Recording and Accessibility permission for your
+keyboard. Keep hands off for about a minute. It needs Screen Recording and Accessibility permission for your
 terminal, `ffmpeg` and the Xcode command-line tools. When you add a feature, add its steps to `tour` in
 `driver.swift`, and update `Spot` when the layout moves. To check positions, run with `NOTCH_DEMO=1`
 (plus `NOTCH_OPEN_SETTINGS=1` to open Settings at launch) and take a screenshot.
