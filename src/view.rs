@@ -10,8 +10,8 @@ use rune::{Color, Cx, El, ScrollSpec, Spring, Transition, Tx, col, el, row, spac
 use crate::island::{self, Event};
 use crate::oncall::{Incident, Origin, Role, Shift, Snapshot, Week, initials, span, when};
 use crate::issues::{self, Notice, Ticket};
-use crate::pulls::{self, Activity, Checks, Pull, Review, Status};
-use crate::{FireView, Peek, Section, State};
+use crate::pulls::{self, Activity, Checks, Merge, Pull, Request, Review, Status};
+use crate::{FireView, Peek, PullView, Section, State};
 
 /// The open panel. The sidebar takes `SIDEBAR` of its width; the rest is the section's.
 pub const PANEL: (f32, f32) = (800.0, 330.0);
@@ -74,20 +74,24 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
         .on_hover_change(|s: &mut State, inside, tx| {
             let now = tx.clock();
             let event = if inside { Event::Enter { now } } else { Event::Leave { now } };
-            if let (true, Some(peek)) = (inside, &s.peek) { s.section = peek.section; }
+            if inside { s.follow_peek(); }
             for e in island::step(&mut s.seq, &mut s.island, event) {
                 match e { island::Effect::WakeAt(due) => tx.wake_at(due) }
             }
         })
         .on_press(|s: &mut State| {
-            if let Some(peek) = &s.peek { s.section = peek.section; }
+            s.follow_peek();
             let _ = island::step(&mut s.seq, &mut s.island, Event::Press);
         })
         .child(body);
     col().w_full().h_full().items_center().child(island)
 }
 
-fn unread_pulls(s: &State) -> usize { pulls::unread_count(&s.github.data.list, &s.github.read) }
+fn unread_yours(s: &State) -> usize { pulls::unread_count(&s.github.data.list, &s.github.read) }
+
+fn unread_reviews(s: &State) -> usize { pulls::unread_count(&s.github.data.reviews, &s.github.read) }
+
+fn unread_pulls(s: &State) -> usize { unread_yours(s) + unread_reviews(s) }
 
 fn unread_issues(s: &State) -> usize { issues::unread_count(&s.linear.data.list, &s.linear.read) }
 
@@ -259,19 +263,19 @@ fn top_bar(s: &State) -> El {
         .child(row().key("wing-right").w(wing).items_center().justify_end().clip_rounded(0.0).child(right))
 }
 
+fn tab(key: &'static str, name: &'static str, on: bool, count: usize, color: Color, pick: impl Fn(&mut State) + 'static) -> El {
+    let mut tab = row().key(key).hit().gap(5.0).items_center().px(10.0).h(24.0).radius(12.0)
+        .fill(WHITE.alpha(if on { 0.14 } else { 0.0 })).hover(WHITE.alpha(0.08))
+        .on_press(pick)
+        .child(label(name, 12.0, if on { 600.0 } else { 500.0 }, if on { WHITE } else { dim() }));
+    if count > 0 { tab = tab.child(badge(count, color)); }
+    tab
+}
+
 fn fire(s: &State) -> El {
-    let chip = |view: FireView, key: &'static str, name: &'static str, count: usize| {
-        let on = s.fire == view;
-        let mut chip = row().key(key).hit().gap(5.0).items_center().px(10.0).h(24.0).radius(12.0)
-            .fill(WHITE.alpha(if on { 0.14 } else { 0.0 })).hover(WHITE.alpha(0.08))
-            .on_press(move |s: &mut State| s.fire = view)
-            .child(label(name, 12.0, if on { 600.0 } else { 500.0 }, if on { WHITE } else { dim() }));
-        if count > 0 { chip = chip.child(badge(count, red())); }
-        chip
-    };
     let switch = row().gap(2.0)
-        .child(chip(FireView::OnCall, "view-oncall", "On-call", 0))
-        .child(chip(FireView::Incidents, "view-incidents", "Incidents", s.snap.incidents.len()));
+        .child(tab("view-oncall", "On-call", s.fire == FireView::OnCall, 0, red(), |s| s.fire = FireView::OnCall))
+        .child(tab("view-incidents", "Incidents", s.fire == FireView::Incidents, s.snap.incidents.len(), red(), |s| s.fire = FireView::Incidents));
     col().w_full().gap(10.0).child(switch).child(match s.fire {
         FireView::OnCall => oncall(s),
         FireView::Incidents => incidents(s),
@@ -420,11 +424,9 @@ const ROW: f32 = 46.0;
 const ROW_GAP: f32 = 6.0;
 const ROWS: usize = 4;
 
-fn unread_list(key: &'static str, title: &str, unread: usize, mark_all: fn(&mut State), rows: Vec<El>, empty: &str) -> El {
-    let mut header = row().w_full().h(22.0).items_center()
-        .child(caps(&if unread > 0 { format!("{title} · {unread} unread") } else { title.to_string() }))
-        .child(spacer());
-    if unread > 0 {
+fn unread_list(key: &'static str, title: El, any_unread: bool, mark_all: fn(&mut State), rows: Vec<El>, empty: &str) -> El {
+    let mut header = row().w_full().h(24.0).items_center().child(title).child(spacer());
+    if any_unread {
         header = header.child(row().key("mark-all-read").hit().px(9.0).h(22.0).radius(11.0).items_center().hover(WHITE.alpha(0.12))
             .on_press(mark_all)
             .child(label("Mark all read", 11.0, 600.0, dim())));
@@ -441,6 +443,7 @@ fn unread_list(key: &'static str, title: &str, unread: usize, mark_all: fn(&mut 
     col().w_full().gap(8.0).child(header).child(list)
 }
 
+/// `color` is the unread count's: the integration's when it counts, grey when it doesn't.
 fn list_row(key: String, unread: usize, color: Color, title: &str, detail: String, right: El, open: impl Fn(&mut State, &mut Tx) + 'static) -> El {
     let new = unread > 0;
     let marker = if new { badge(unread, color) } else { el().size(16.0, 16.0) };
@@ -458,30 +461,34 @@ fn chip(text: &str, color: Color) -> El {
     row().px(8.0).h(20.0).radius(10.0).items_center().fill(color.alpha(0.18)).child(label(text, 11.0, 600.0, color))
 }
 
-/// Your pull requests, unread first. A click opens one at its oldest unread event and marks it
-/// read.
+/// Your pull requests or those you're asked to review, unread first. A click opens one at its
+/// oldest unread event and marks it read.
 fn pull_list(s: &State) -> El {
     let gh = &s.github;
-    let rows = pulls::shown(&gh.data.list, &gh.read).into_iter().map(|(p, unread)| pull_row(p, &unread, s.snap.now)).collect();
-    unread_list("list-github", "Your pull requests", unread_pulls(s), State::mark_pulls_read, rows, "No open pull requests")
+    let (list, key, empty) = match s.pulls {
+        PullView::Yours => (&gh.data.list, "list-github", "No open pull requests"),
+        PullView::Reviews => (&gh.data.reviews, "list-reviews", "Nothing to review"),
+    };
+    let shown = pulls::shown(list, &gh.read);
+    let any_unread = shown.iter().any(|(_, unread)| !unread.is_empty());
+    let rows = shown.into_iter().map(|(p, unread)| pull_row(p, &unread, s.snap.now)).collect();
+    let switch = row().gap(2.0)
+        .child(tab("view-yours", "Your pull requests", s.pulls == PullView::Yours, unread_yours(s), purple(), |s| s.pulls = PullView::Yours))
+        .child(tab("view-reviews", "To review", s.pulls == PullView::Reviews, unread_reviews(s), purple(), |s| s.pulls = PullView::Reviews));
+    unread_list(key, switch, any_unread, State::mark_pulls_read, rows, empty)
 }
 
 fn pull_row(p: &Pull, unread: &[&Activity], now: NaiveDateTime) -> El {
     let repo = p.repo.rsplit('/').next().unwrap_or(&p.repo);
-    let detail = match unread.last() {
-        Some(a) => {
+    let place = format!("{repo} #{}", p.number);
+    let detail = match (unread.last(), p.author.as_str()) {
+        (Some(a), "") => {
             let what = format!("{} · {} ago", a.headline(), span(now - a.at));
             if a.excerpt.is_empty() { what } else { format!("{what}: {}", a.excerpt) }
         }
-        None => format!("{repo} #{} · updated {} ago", p.number, span(now - p.updated)),
-    };
-    let (state, color) = match (p.status, p.review) {
-        (Status::Merged, _) => ("Merged", purple()),
-        (Status::Closed, _) => ("Closed", red()),
-        (Status::Draft, _) => ("Draft", dim()),
-        (_, Review::Approved) => ("Approved", green()),
-        (_, Review::ChangesRequested) => ("Changes", rgb(0xff8a3d)),
-        _ => ("Open", dim()),
+        (Some(a), _) => format!("{} · {place} · {} ago", a.headline(), span(now - a.at)),
+        (None, "") => format!("{place} · updated {} ago", span(now - p.updated)),
+        (None, author) => format!("{author} · {place} · updated {} ago", span(now - p.updated)),
     };
     let mut right = row().gap(8.0).items_center();
     match p.checks {
@@ -490,8 +497,22 @@ fn pull_row(p: &Pull, unread: &[&Activity], now: NaiveDateTime) -> El {
         Checks::Pending => right = right.child(el().size(7.0, 7.0).radius(3.5).fill(amber())),
         Checks::None => {}
     }
+    let state = match (&p.request, p.status, p.merge, p.review) {
+        (Some(Request::You), ..) => chip("You", purple()),
+        (Some(Request::Team(team)), ..) => chip(team, dim()),
+        (_, Status::Merged, ..) => chip("Merged", purple()),
+        (_, Status::Closed, ..) => chip("Closed", red()),
+        (_, Status::Draft, ..) => chip("Draft", dim()),
+        // Solid, to stand out from the tinted "Approved" it follows.
+        (_, _, Merge::Ready, _) => row().px(8.0).h(20.0).radius(10.0).items_center().fill(green()).child(label("Ready to merge", 11.0, 700.0, BLACK)),
+        (_, _, Merge::Conflicts, _) => chip("Conflicts", rgb(0xff8a3d)),
+        (.., Review::Approved) => chip("Approved", green()),
+        (.., Review::ChangesRequested) => chip("Changes", rgb(0xff8a3d)),
+        _ => chip("Open", dim()),
+    };
+    let color = if p.counts() { purple() } else { WHITE.alpha(0.25) };
     let id = p.id.clone();
-    list_row(format!("pull-{}", p.id), unread.len(), purple(), &p.title, detail, right.child(chip(state, color)),
+    list_row(format!("pull-{}", p.id), unread.len(), color, &p.title, detail, right.child(state),
         move |s: &mut State, tx: &mut Tx| s.open_pull(&id, tx))
 }
 
@@ -500,7 +521,9 @@ fn pull_row(p: &Pull, unread: &[&Activity], now: NaiveDateTime) -> El {
 fn ticket_list(s: &State) -> El {
     let ln = &s.linear;
     let rows = issues::shown(&ln.data.list, &ln.read).into_iter().map(|(t, unread)| ticket_row(t, &unread, s.snap.now)).collect();
-    unread_list("list-linear", "Linear", unread_issues(s), State::mark_issues_read, rows, "No open issues and nothing new")
+    let unread = unread_issues(s);
+    let title = caps(&if unread > 0 { format!("Linear · {unread} unread") } else { "Linear".to_string() });
+    unread_list("list-linear", title, unread > 0, State::mark_issues_read, rows, "No open issues and nothing new")
 }
 
 fn ticket_row(t: &Ticket, unread: &[&Notice], now: NaiveDateTime) -> El {

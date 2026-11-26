@@ -2,7 +2,7 @@
 //!
 //! `cargo run --release` puts it at the top of whichever display the pointer is on. Headless stills, with no window:
 //! `cargo run -- --scene open --snap snaps/open.png` (scenes: collapsed, open, incidents,
-//! offhours, pulls, linear, peek).
+//! offhours, pulls, reviews, linear, peek).
 //!
 //! Open, the panel has a sidebar of integrations (FireHydrant, GitHub, Linear) and shows the
 //! selected one's data beside it.
@@ -48,11 +48,16 @@ pub enum Section { FireHydrant, GitHub, Linear }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FireView { OnCall, Incidents }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullView { Yours, Reviews }
+
 /// Something new, shown under the collapsed island for a few seconds. Opening the panel from
 /// it goes to its section.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Peek {
     pub section: Section,
+    /// For GitHub, which list.
+    pub pulls: Option<PullView>,
     /// Who did it, for the avatar.
     pub who: String,
     pub headline: String,
@@ -68,6 +73,7 @@ pub struct State {
     pub seq: Seq,
     pub section: Section,
     pub fire: FireView,
+    pub pulls: PullView,
     /// The latest fetch (or the mock), and what the view shows from it at `snap.now`.
     pub data: Data,
     pub snap: Snapshot,
@@ -139,6 +145,7 @@ fn init() -> State {
         seq: Seq::default(),
         section: Section::FireHydrant,
         fire: FireView::OnCall,
+        pulls: PullView::Yours,
         snap: Snapshot::build(&data, now()),
         data,
         results: None,
@@ -217,12 +224,15 @@ fn connect_github(s: &mut State) {
 /// Takes in finished GitHub fetches and peeks the newest new event, unless the panel is open.
 fn take_pulls(s: &mut State, clock: f64) -> bool {
     let gh = &mut s.github;
-    let arrived = gh.take(|read, pulls| read.sync(pulls.list.iter().map(|p| (p.id.as_str(), p.read_on_github)), now()));
+    let arrived = gh.take(|read, pulls| read.sync(pulls.list.iter().chain(&pulls.reviews).map(|p| (p.id.as_str(), p.read_on_github)), now()));
     if !arrived { return false; }
-    let new = gh.announced.update(pulls::unread_events(&gh.data.list, &gh.read));
+    let mut unread = pulls::unread_events(&gh.data.list, &gh.read);
+    unread.extend(pulls::unread_events(&gh.data.reviews, &gh.read));
+    let new = gh.announced.update(unread);
     if let (Some((p, a)), false) = (new.into_iter().max_by_key(|(_, a)| a.at), s.island.is_open()) {
         s.peek = Some(Peek {
             section: Section::GitHub,
+            pulls: Some(if p.request.is_some() { PullView::Reviews } else { PullView::Yours }),
             who: a.who.clone(),
             headline: format!("{} on #{}", a.headline(), p.number),
             detail: if a.excerpt.is_empty() { p.title.clone() } else { a.excerpt.clone() },
@@ -257,6 +267,7 @@ fn take_issues(s: &mut State, clock: f64) -> bool {
         let on = if t.key.is_empty() { t.title.clone() } else { t.key.clone() };
         s.peek = Some(Peek {
             section: Section::Linear,
+            pulls: None,
             who: if n.who.is_empty() { "Linear".into() } else { n.who.clone() },
             headline: format!("{} on {on}", n.headline),
             detail: if n.excerpt.is_empty() { t.title.clone() } else { n.excerpt.clone() },
@@ -284,15 +295,24 @@ impl State {
     /// Opens a pull request where its oldest unread event is, and marks it read.
     pub fn open_pull(&mut self, id: &str, tx: &mut Tx) {
         let gh = &mut self.github;
-        let Some(pull) = gh.data.list.iter().find(|p| p.id == id) else { return };
+        let Some(pull) = gh.data.list.iter().chain(&gh.data.reviews).find(|p| p.id == id) else { return };
         let url = pull.unread(&gh.read).first().map_or(pull.url.as_str(), |a| a.url.as_str()).to_string();
         gh.read.mark(id, now());
         if !url.is_empty() && let Err(e) = tx.open_url(&url) { eprintln!("github: can't open {url}: {e:?}"); }
     }
 
+    /// Marks the list on show read.
     pub fn mark_pulls_read(&mut self) {
         let gh = &mut self.github;
-        gh.read.mark_all(gh.data.list.iter().filter_map(|p| Some((p.id.as_str(), p.activity.last()?.at))));
+        let list = if self.pulls == PullView::Reviews { &gh.data.reviews } else { &gh.data.list };
+        gh.read.mark_all(list.iter().filter_map(|p| Some((p.id.as_str(), p.activity.last()?.at))));
+    }
+
+    /// Opening the panel from a peek goes to what it showed.
+    pub fn follow_peek(&mut self) {
+        let Some(peek) = &self.peek else { return };
+        self.section = peek.section;
+        if let Some(view) = peek.pulls { self.pulls = view; }
     }
 }
 
@@ -388,11 +408,12 @@ fn spec() -> AppSpec<State> {
             ("incidents", |s| { freeze(s, scene_time(10, 14, 5)); s.island = Island::Open; s.fire = FireView::Incidents; }),
             ("offhours", |s| { freeze(s, scene_time(14, 11, 30)); s.island = Island::Open; }),
             ("pulls", |s| { freeze(s, scene_time(10, 14, 5)); s.island = Island::Open; s.section = Section::GitHub; }),
+            ("reviews", |s| { freeze(s, scene_time(10, 14, 5)); s.island = Island::Open; s.section = Section::GitHub; s.pulls = PullView::Reviews; }),
             ("linear", |s| { freeze(s, scene_time(10, 14, 5)); s.island = Island::Open; s.section = Section::Linear; }),
             ("peek", |s| {
                 freeze(s, scene_time(10, 14, 5));
                 let (pull, a) = (&s.github.data.list[0], &s.github.data.list[0].activity[1]);
-                s.peek = Some(Peek { section: Section::GitHub, who: a.who.clone(), headline: format!("{} on #{}", a.headline(), pull.number),
+                s.peek = Some(Peek { section: Section::GitHub, pulls: Some(PullView::Yours), who: a.who.clone(), headline: format!("{} on #{}", a.headline(), pull.number),
                     detail: a.excerpt.clone(), until: 0.0 });
             }),
         ],
@@ -437,14 +458,19 @@ fn probe_github() {
     match client.fetch(now()) {
         Ok(found) => {
             let read = ReadState::load(pulls::READ_FILE, now());
-            println!("you are {}: {} pull requests, {} with something unread", found.login, found.list.len(), pulls::unread_count(&found.list, &read));
+            println!("you are {}: {} pull requests, {} with something unread; {} to review, {} new that count",
+                found.login, found.list.len(), pulls::unread_count(&found.list, &read), found.reviews.len(), pulls::unread_count(&found.reviews, &read));
             for w in &found.warnings { println!("note: {w}"); }
-            for (p, _) in pulls::shown(&found.list, &read) {
-                let last = read.last_read(&p.id, p.read_on_github);
-                println!("  {}#{} [{:?} · checks {:?} · review {:?}] {}", p.repo, p.number, p.status, p.checks, p.review, p.title);
-                println!("    last read {}{}", last.format("%F %T"), p.read_on_github.map(|t| format!(" (on GitHub {})", t.format("%F %T"))).unwrap_or_default());
-                for a in &p.activity {
-                    println!("    {} {} {}{}", if a.at > last { "*" } else { " " }, a.at, a.headline(), if a.excerpt.is_empty() { String::new() } else { format!(": {}", a.excerpt) });
+            for (title, list) in [("yours", &found.list), ("to review", &found.reviews)] {
+                println!("{title}:");
+                for (p, _) in pulls::shown(list, &read) {
+                    let last = read.last_read(&p.id, p.read_on_github);
+                    let by = if p.author.is_empty() { String::new() } else { format!(" · by {} · for {:?}", p.author, p.request) };
+                    println!("  {}#{} [{:?} · checks {:?} · review {:?} · merge {:?}{by}] {}", p.repo, p.number, p.status, p.checks, p.review, p.merge, p.title);
+                    println!("    last read {}{}", last.format("%F %T"), p.read_on_github.map(|t| format!(" (on GitHub {})", t.format("%F %T"))).unwrap_or_default());
+                    for a in &p.activity {
+                        println!("    {} {} {}{}", if a.at > last { "*" } else { " " }, a.at, a.headline(), if a.excerpt.is_empty() { String::new() } else { format!(": {}", a.excerpt) });
+                    }
                 }
             }
         }

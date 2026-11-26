@@ -1,5 +1,5 @@
-//! Your pull requests and what other people did on them, from GitHub (`github.rs`) or the mock
-//! here, and which of that you haven't read yet.
+//! Your pull requests and what other people did on them, the pull requests you're asked to
+//! review, from GitHub (`github.rs`) or the mock here, and which of that you haven't read yet.
 //!
 //! Unread is what others did after you last read a pull request: the later of when you opened
 //! it from the panel and when GitHub last saw you read it (the notification's `last_read_at`,
@@ -27,7 +27,11 @@ pub enum Kind {
     Merged,
     Closed,
     Reopened,
+    ReviewRequested(Request),
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Request { You, Team(String) }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Activity {
@@ -54,6 +58,8 @@ impl Activity {
             Kind::Merged => "merged it".to_string(),
             Kind::Closed => "closed it".to_string(),
             Kind::Reopened => "reopened it".to_string(),
+            Kind::ReviewRequested(Request::You) => "requested your review".to_string(),
+            Kind::ReviewRequested(Request::Team(team)) => format!("requested review from {team}"),
         };
         format!("{} {what}", self.who)
     }
@@ -71,6 +77,10 @@ pub enum Checks { None, Pending, Passing, Failing }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Review { None, Required, Approved, ChangesRequested }
 
+/// Whether GitHub would merge it now: `Ready` is approved with every requirement met.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Merge { Ready, Conflicts, Waiting }
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pull {
     /// GitHub's node ID, which read state is kept under.
@@ -81,11 +91,17 @@ pub struct Pull {
     pub title: String,
     /// Empty in the mock.
     pub url: String,
+    /// Who opened it, for one you're asked to review; empty for yours.
+    pub author: String,
+    /// Set for one you're asked to review.
+    pub request: Option<Request>,
     pub status: Status,
     pub checks: Checks,
     pub review: Review,
+    pub merge: Merge,
     pub updated: NaiveDateTime,
-    /// What other people did, oldest first. Yours and bots' are left out.
+    /// What other people did, oldest first. Yours and bots' are left out. For one you're asked
+    /// to review, just the request.
     pub activity: Vec<Activity>,
     /// When GitHub last saw you read it, if its notification was found.
     pub read_on_github: Option<NaiveDateTime>,
@@ -97,6 +113,8 @@ pub struct Pulls {
     pub login: String,
     /// Your open pull requests, and the recently closed ones.
     pub list: Vec<Pull>,
+    /// Others' pull requests waiting for a review from you or a team of yours.
+    pub reviews: Vec<Pull>,
     pub origin: Origin,
     /// Things that work but less well than they could (GitHub's read state unavailable,
     /// organisations hidden behind SSO), for the connection test and `--probe-github`.
@@ -104,7 +122,7 @@ pub struct Pulls {
 }
 
 impl Pulls {
-    pub fn loading() -> Self { Pulls { login: String::new(), list: vec![], origin: Origin::Loading, warnings: vec![] } }
+    pub fn loading() -> Self { Pulls { login: String::new(), list: vec![], reviews: vec![], origin: Origin::Loading, warnings: vec![] } }
 }
 
 impl Pull {
@@ -113,6 +131,10 @@ impl Pull {
         let last = read.last_read(&self.id, self.read_on_github);
         self.activity.iter().filter(|a| a.at > last).collect()
     }
+
+    /// Whether its unread count shows: anything on yours, and a request to review that asked
+    /// you. One that asked only a team of yours is listed and announced but not counted.
+    pub fn counts(&self) -> bool { !matches!(self.request, Some(Request::Team(_))) }
 }
 
 /// Unread events across pull requests, keyed for `Announced`.
@@ -120,35 +142,46 @@ pub fn unread_events<'a>(pulls: &'a [Pull], read: &ReadState) -> Vec<(String, (&
     pulls.iter().flat_map(|p| p.unread(read).into_iter().map(move |a| (a.key(p), (p, a)))).collect()
 }
 
-/// What the panel lists: unread first, newest event first, then the other open ones by last
-/// update. A closed pull request shows only while something on it is unread.
+/// What the panel lists: unread first (counted before not), newest event first, then the rest
+/// with ready to merge and asked of you first, by last update. A closed pull request shows only
+/// while something on it is unread.
 pub fn shown<'a>(pulls: &'a [Pull], read: &ReadState) -> Vec<(&'a Pull, Vec<&'a Activity>)> {
     let mut rows: Vec<_> = pulls.iter().map(|p| (p, p.unread(read)))
         .filter(|(p, unread)| matches!(p.status, Status::Open | Status::Draft) || !unread.is_empty())
         .collect();
     let newest = |unread: &[&Activity]| unread.iter().map(|a| a.at).max();
-    rows.sort_by_key(|(p, unread)| std::cmp::Reverse((!unread.is_empty(), newest(unread), p.updated)));
+    rows.sort_by_key(|(p, unread)| {
+        let first = p.merge == Merge::Ready || p.request == Some(Request::You);
+        std::cmp::Reverse((p.counts() && !unread.is_empty(), !unread.is_empty(), newest(unread), first, p.updated))
+    });
     rows
 }
 
 pub fn unread_count(pulls: &[Pull], read: &ReadState) -> usize {
-    pulls.iter().filter(|p| !p.unread(read).is_empty()).count()
+    pulls.iter().filter(|p| p.counts() && !p.unread(read).is_empty()).count()
 }
 
-/// Made-up pull requests: three with something unread, and the same people as the on-call mock.
+/// Made-up pull requests, with the same people as the on-call mock: three of yours with
+/// something unread, one of them ready to merge, and three to review, two of them new.
 pub fn mock(now: NaiveDateTime) -> Pulls {
     let ago = |m: i64| now - Duration::minutes(m);
     let did = |who: &str, m: i64, kind: Kind, excerpt: &str| Activity { who: who.into(), at: ago(m), kind, excerpt: excerpt.into(), url: String::new() };
     let pull = |id: &str, repo: &str, number: u64, title: &str, status, checks, review, activity: Vec<Activity>, read: i64| Pull {
-        id: id.into(), repo: repo.into(), number, title: title.into(), url: String::new(), status, checks, review,
+        id: id.into(), repo: repo.into(), number, title: title.into(), url: String::new(), author: String::new(), request: None,
+        status, checks, review, merge: Merge::Waiting,
         updated: activity.iter().map(|a| a.at).max().unwrap_or(ago(600)), activity, read_on_github: Some(ago(read)),
     };
+    let ready = |p: Pull| Pull { merge: Merge::Ready, ..p };
+    let review = |id: &str, repo: &str, number: u64, title: &str, author: &str, request: Request, m: i64, checks, read: i64| Pull {
+        author: author.into(), request: Some(request.clone()),
+        ..pull(id, repo, number, title, Status::Open, checks, Review::Required, vec![did(author, m, Kind::ReviewRequested(request), "")], read)
+    };
     let list = vec![
-        pull("mock-482", "marmalade/telemetry-ingest", 482, "Raise the consumer lag alert to five minutes", Status::Open, Checks::Passing, Review::Approved, vec![
+        ready(pull("mock-482", "marmalade/telemetry-ingest", 482, "Raise the consumer lag alert to five minutes", Status::Open, Checks::Passing, Review::Approved, vec![
             did("XV", 40, Kind::Approved, ""),
             did("JY", 12, Kind::Commented, "Can we keep paging for lag over 15 minutes? The night shift relies on it."),
             did("ZQ", 3, Kind::Reacted { emoji: "👍", on_comment: true }, "Bumped it to 5m: the 60 s threshold paged us on every deploy."),
-        ], 30),
+        ], 30)),
         pull("mock-1291", "marmalade/api-gateway", 1291, "Retry idempotent requests on 503", Status::Open, Checks::Failing, Review::ChangesRequested, vec![
             did("ZQ", 130, Kind::ChangesRequested, "POST isn't idempotent here; gate the retry on the method."),
         ], 90),
@@ -161,7 +194,13 @@ pub fn mock(now: NaiveDateTime) -> Pulls {
         ], 120),
         pull("mock-77", "marmalade/platform-terraform", 77, "Move the ingest workers to arm64", Status::Draft, Checks::Pending, Review::Required, vec![], 900),
     ];
-    Pulls { login: "OP".into(), list, origin: Origin::Mock, warnings: vec![] }
+    let team = || Request::Team("platform".into());
+    let reviews = vec![
+        review("mock-1302", "marmalade/api-gateway", 1302, "Add rate-limit headers to every response", "JY", Request::You, 8, Checks::Passing, 600),
+        review("mock-490", "marmalade/telemetry-ingest", 490, "Batch writes to the cold store", "ZQ", team(), 50, Checks::Pending, 600),
+        review("mock-41", "marmalade/runbooks", 41, "Document the failover drill", "XV", team(), 2900, Checks::None, 2000),
+    ];
+    Pulls { login: "OP".into(), list, reviews, origin: Origin::Mock, warnings: vec![] }
 }
 
 #[cfg(test)]
@@ -173,8 +212,8 @@ mod tests {
 
     fn pull(activity: &[(u32, u32)], read_on_github: Option<NaiveDateTime>) -> Pull {
         Pull {
-            id: "p".into(), repo: "o/r".into(), number: 1, title: "T".into(), url: String::new(), status: Status::Open,
-            checks: Checks::None, review: Review::None, updated: at(9, 0), read_on_github,
+            id: "p".into(), repo: "o/r".into(), number: 1, title: "T".into(), url: String::new(), author: String::new(), request: None,
+            status: Status::Open, checks: Checks::None, review: Review::None, merge: Merge::Waiting, updated: at(9, 0), read_on_github,
             activity: activity.iter().map(|&(h, m)| Activity { who: "XV".into(), at: at(h, m), kind: Kind::Commented, excerpt: String::new(), url: String::new() }).collect(),
         }
     }
@@ -209,5 +248,19 @@ mod tests {
         let mut read = read;
         read.mark("mock-479", now);
         assert!(shown(&pulls.list, &read).iter().all(|(p, _)| p.number != 479), "merged and read: gone");
+        read.mark("mock-482", now);
+        assert_eq!(shown(&pulls.list, &read)[1].0.number, 482, "ready to merge goes before the other read ones");
+    }
+
+    #[test]
+    fn only_requests_that_asked_you_count() {
+        let now = at(14, 5);
+        let pulls = mock(now);
+        let read = ReadState::memory(now - Duration::days(30));
+        let rows: Vec<_> = shown(&pulls.reviews, &read).iter().map(|(p, u)| (p.number, u.len())).collect();
+        assert_eq!(rows, [(1302, 1), (490, 1), (41, 0)], "asked of you, then of your team, then read");
+        assert_eq!(unread_count(&pulls.reviews, &read), 1, "the team's request is listed but not counted");
+        assert_eq!(unread_events(&pulls.reviews, &read).len(), 2, "both are announced");
+        assert_eq!(pulls.reviews[1].activity[0].headline(), "ZQ requested review from platform");
     }
 }

@@ -1,7 +1,7 @@
 # Notch Assistant
 
 A Dynamic-Island-style panel for the MacBook notch that shows your FireHydrant on-call rotation and
-incidents, what others did on your GitHub pull requests, and your Linear issues and notifications, built
+incidents, your GitHub pull requests and the ones you're asked to review, and your Linear issues and notifications, built
 with [Rune](https://github.com/anomalyco/rune). Hover the notch and it springs open; move away and it closes
 after a short grace period. On an external display it sits in the middle of the menu bar as a "virtual
 notch".
@@ -10,13 +10,13 @@ notch".
 
 **Demo video:** [demo/notch-assistant.mp4](demo/notch-assistant.mp4) (40 s: hover, each integration in the sidebar, Settings, connecting).
 
-| Collapsed | Incidents | Off hours |
-| --- | --- | --- |
-| ![](snaps/collapsed.png) | ![](snaps/incidents.png) | ![](snaps/offhours.png) |
+| Collapsed | Something new | Incidents | Off hours |
+| --- | --- | --- | --- |
+| ![](snaps/collapsed.png) | ![](snaps/peek.png) | ![](snaps/incidents.png) | ![](snaps/offhours.png) |
 
-| GitHub | Linear | Something new |
+| Your pull requests | To review | Linear |
 | --- | --- | --- |
-| ![](snaps/pulls.png) | ![](snaps/linear.png) | ![](snaps/peek.png) |
+| ![](snaps/pulls.png) | ![](snaps/reviews.png) | ![](snaps/linear.png) |
 
 ## What it shows
 
@@ -26,8 +26,11 @@ The open panel has a sidebar of integrations, each with its count; pick one and 
   - **On-call:** who is primary and secondary now, your current shift with time left, your next shift,
     and a five-week rotation strip like FireHydrant's month view.
   - **Incidents:** the team's open incidents with severity, status, age and commander.
-- **GitHub:** your open pull requests, unread first: who commented, reviewed, reacted to your comment or
-  merged it since you last looked, with checks and review state.
+- **GitHub**, with a switch between:
+  - **Your pull requests:** unread first: who commented, reviewed, reacted to your comment or merged it
+    since you last looked, with checks and review state. "Ready to merge" marks the ones GitHub would
+    merge now.
+  - **To review:** others' pull requests waiting for your review or a team's, new requests first.
 - **Linear:** issues and projects with notifications you haven't read (mentions, comments, status
   changes, assignments, SLA breaches), then your open issues.
 - **Collapsed:** a dot left of the notch (green: you're primary, amber: secondary, grey: off call), a count
@@ -105,7 +108,7 @@ the service. How to create them, what counts, and what each one calls:
 ```sh
 cargo run --release                                        # run it (stop the installed copy first)
 cargo test
-cargo run -- --scene open --snap snaps/open.png           # scenes: collapsed, open, incidents, offhours, pulls, linear, peek
+cargo run -- --scene open --snap snaps/open.png           # scenes: collapsed, open, incidents, offhours, pulls, reviews, linear, peek
 cargo run -- --scene collapsed --script scripts/hover.json --snap mid.png --at 0.75
 ```
 
