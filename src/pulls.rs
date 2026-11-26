@@ -8,7 +8,9 @@
 //! notification for a reaction, so a reaction stays unread until you read the pull request
 //! after it.
 
-use chrono::{Duration, NaiveDateTime};
+use chrono::Duration;
+
+use crate::time::Time;
 
 use crate::oncall::Origin;
 use crate::read::ReadState;
@@ -37,7 +39,7 @@ pub enum Request { You, Team(String) }
 pub struct Activity {
     /// Their name on GitHub, else their login.
     pub who: String,
-    pub at: NaiveDateTime,
+    pub at: Time,
     pub kind: Kind,
     /// What they wrote, or for a reaction what it was on; may be empty.
     pub excerpt: String,
@@ -65,7 +67,7 @@ impl Activity {
     }
 
     /// Tells one event from another across refreshes, to notice the new ones.
-    fn key(&self, pull: &Pull) -> String { format!("{}|{}|{}|{:?}", pull.id, self.at, self.who, self.kind) }
+    fn key(&self, pull: &Pull) -> String { format!("{}|{}|{}|{:?}", pull.id, self.at.timestamp(), self.who, self.kind) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,12 +101,12 @@ pub struct Pull {
     pub checks: Checks,
     pub review: Review,
     pub merge: Merge,
-    pub updated: NaiveDateTime,
+    pub updated: Time,
     /// What other people did, oldest first. Yours and bots' are left out. For one you're asked
     /// to review, just the request.
     pub activity: Vec<Activity>,
     /// When GitHub last saw you read it, if its notification was found.
-    pub read_on_github: Option<NaiveDateTime>,
+    pub read_on_github: Option<Time>,
 }
 
 /// One fetch's worth of pull requests.
@@ -115,14 +117,22 @@ pub struct Pulls {
     pub list: Vec<Pull>,
     /// Others' pull requests waiting for a review from you or a team of yours.
     pub reviews: Vec<Pull>,
+    /// Whether `reviews` has loaded at least once since connecting. Until then it's empty for
+    /// want of an answer, so the requests that turn up later aren't new.
+    pub reviews_loaded: bool,
     pub origin: Origin,
-    /// Things that work but less well than they could (GitHub's read state unavailable,
-    /// organisations hidden behind SSO), for the connection test and `--probe-github`.
-    pub warnings: Vec<String>,
+    /// What's wrong, one plain sentence each, for the panel to show: a part that couldn't
+    /// refresh (its last good data stays), organisations hidden behind SSO, GitHub's read state
+    /// unavailable.
+    pub trouble: Vec<String>,
+    /// Lists cut short at GitHub's page size: worth saying, but nothing is wrong.
+    pub limits: Vec<String>,
 }
 
 impl Pulls {
-    pub fn loading() -> Self { Pulls { login: String::new(), list: vec![], reviews: vec![], origin: Origin::Loading, warnings: vec![] } }
+    pub fn loading() -> Self {
+        Pulls { login: String::new(), list: vec![], reviews: vec![], reviews_loaded: false, origin: Origin::Loading, trouble: vec![], limits: vec![] }
+    }
 }
 
 impl Pull {
@@ -163,7 +173,7 @@ pub fn unread_count(pulls: &[Pull], read: &ReadState) -> usize {
 
 /// Made-up pull requests, with the same people as the on-call mock: three of yours with
 /// something unread, one of them ready to merge, and three to review, two of them new.
-pub fn mock(now: NaiveDateTime) -> Pulls {
+pub fn mock(now: Time) -> Pulls {
     let ago = |m: i64| now - Duration::minutes(m);
     let did = |who: &str, m: i64, kind: Kind, excerpt: &str| Activity { who: who.into(), at: ago(m), kind, excerpt: excerpt.into(), url: String::new() };
     let pull = |id: &str, repo: &str, number: u64, title: &str, status, checks, review, activity: Vec<Activity>, read: i64| Pull {
@@ -200,17 +210,15 @@ pub fn mock(now: NaiveDateTime) -> Pulls {
         review("mock-490", "marmalade/telemetry-ingest", 490, "Batch writes to the cold store", "ZQ", team(), 50, Checks::Pending, 600),
         review("mock-41", "marmalade/runbooks", 41, "Document the failover drill", "XV", team(), 2900, Checks::None, 2000),
     ];
-    Pulls { login: "OP".into(), list, reviews, origin: Origin::Mock, warnings: vec![] }
+    Pulls { login: "OP".into(), list, reviews, reviews_loaded: true, origin: Origin::Mock, trouble: vec![], limits: vec![] }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
+    fn at(h: u32, m: u32) -> Time { crate::time::at(2026, 11, 10, h, m) }
 
-    fn at(h: u32, m: u32) -> NaiveDateTime { NaiveDate::from_ymd_opt(2026, 11, 10).unwrap().and_hms_opt(h, m, 0).unwrap() }
-
-    fn pull(activity: &[(u32, u32)], read_on_github: Option<NaiveDateTime>) -> Pull {
+    fn pull(activity: &[(u32, u32)], read_on_github: Option<Time>) -> Pull {
         Pull {
             id: "p".into(), repo: "o/r".into(), number: 1, title: "T".into(), url: String::new(), author: String::new(), request: None,
             status: Status::Open, checks: Checks::None, review: Review::None, merge: Merge::Waiting, updated: at(9, 0), read_on_github,
@@ -262,5 +270,7 @@ mod tests {
         assert_eq!(unread_count(&pulls.reviews, &read), 1, "the team's request is listed but not counted");
         assert_eq!(unread_events(&pulls.reviews, &read).len(), 2, "both are announced");
         assert_eq!(pulls.reviews[1].activity[0].headline(), "ZQ requested review from platform");
+        assert!(pulls.reviews_loaded, "the mock's requests are as loaded as they get");
+        assert!(!Pulls::loading().reviews_loaded);
     }
 }

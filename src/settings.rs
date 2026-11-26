@@ -27,33 +27,86 @@ pub struct Settings {
     tests: Option<Receiver<Result<String, String>>>,
     /// A permission prompt waiting for its answer.
     asking: Option<Receiver<()>>,
+    /// What the Keychain says, on its way from `load`.
+    loading: Option<Receiver<Loaded>>,
     waker: Option<Waker>,
     /// The panel, told to reconnect when settings change.
     panel: Option<OverlayHandle<crate::State>>,
     /// Open at login (read when the window opens and after a change).
     pub login: Login,
+    /// Per integration: it has what it needs. Read with the rest when the window opens, since
+    /// checking a secret runs the Keychain tool, too slow for every frame.
+    configured: Vec<bool>,
+    /// The panel shows in screen sharing and recordings.
+    pub in_capture: bool,
 }
+
+/// The window's Keychain-backed state, read on a thread.
+struct Loaded {
+    /// The integration it was read for; another may be selected by the time it arrives.
+    selected: usize,
+    saved: Vec<bool>,
+    configured: Vec<bool>,
+}
+
+/// Where the panel's own options live in settings.json.
+const GENERAL: &str = "general";
+
+/// Whether the panel shows in screen sharing and recordings. Off unless asked for, so a shared
+/// screen doesn't show what the panel peeks at.
+pub fn in_capture() -> bool { crate::demo::on() || store::setting(GENERAL, "in_capture").is_some() }
 
 impl Settings {
     pub fn new(panel: Option<OverlayHandle<crate::State>>) -> Self {
-        let mut s = Settings { selected: 0, edits: vec![], saved: vec![], status: Status::Idle, tests: None, asking: None, waker: None, panel, login: Login::Unavailable };
-        s.load();
+        let mut s = Settings { selected: 0, edits: vec![], saved: vec![], status: Status::Idle, tests: None, asking: None, loading: None, waker: None,
+            panel, login: Login::Unavailable, configured: vec![false; ALL.len()], in_capture: false };
+        s.local();
         s
     }
 
     fn integration(&self) -> &'static Integration { ALL[self.selected] }
 
-    /// Fills the editors from what's stored. Secrets stay empty.
-    fn load(&mut self) {
+    /// Fills the editors from what's stored. Secrets stay empty, and whether one is saved comes
+    /// later, from `load`.
+    fn fields(&mut self) {
         let i = self.integration();
         self.edits = i.fields.iter().map(|f| match f.kind {
             FieldKind::Secret => TextEdit::new("").secure(),
-            FieldKind::Text => TextEdit::new(&store::setting(i.id, f.key).unwrap_or_default()),
+            FieldKind::Text => TextEdit::new(store::setting(i.id, f.key).unwrap_or_default()),
             FieldKind::Permission(_) => TextEdit::new(""),
         }).collect();
-        self.saved = i.fields.iter().map(|f| matches!(f.kind, FieldKind::Secret) && i.value(f.key).is_some()).collect();
+        self.saved = vec![false; i.fields.len()];
+    }
+
+    /// What the window shows that doesn't need the Keychain.
+    fn local(&mut self) {
+        self.fields();
+        self.in_capture = in_capture();
         // The demo and snapshots never touch the real login items.
         self.login = if crate::sandboxed() { Login::Off } else { login::status() };
+    }
+
+    /// Reads everything the window shows: when it opens and after a change. What the Keychain
+    /// says comes from a thread and lands in `poll`, because the Keychain's unlock prompt would
+    /// otherwise freeze the panel, which runs on this thread too.
+    pub fn load(&mut self) {
+        self.local();
+        let (tx, rx) = channel();
+        let (selected, waker) = (self.selected, self.waker.clone());
+        std::thread::spawn(move || {
+            let i = ALL[selected];
+            let saved = i.fields.iter().map(|f| matches!(f.kind, FieldKind::Secret) && i.value(f.key).is_some()).collect();
+            let _ = tx.send(Loaded { selected, saved, configured: ALL.iter().map(|i| i.configured()).collect() });
+            if let Some(wake) = waker { wake(); }
+        });
+        self.loading = Some(rx);
+    }
+
+    fn toggle_capture(&mut self) {
+        let on = !self.in_capture;
+        if let Err(e) = store::set_setting(GENERAL, "in_capture", if on { "yes" } else { "" }) { self.status = Status::Err(e); return; }
+        self.in_capture = on;
+        if let Some(panel) = &self.panel { panel.set_exclude_from_capture(!on); }
     }
 
     fn toggle_login(&mut self) {
@@ -101,7 +154,7 @@ impl Settings {
         }
         self.load();
         self.reconnect_panel();
-        self.status = Status::Ok(if i.configured() { "Removed. An environment variable still provides it".into() } else { "Removed. The panel is back on mock data".into() });
+        self.status = Status::Ok(if i.overridden(i.required) { "Removed. An environment variable still provides it".into() } else { "Removed. The panel is back on mock data".into() });
     }
 
     fn reconnect_panel(&self) {
@@ -136,6 +189,12 @@ impl Settings {
 pub fn setup(s: &mut Settings, waker: Waker) { s.waker = Some(waker); }
 
 pub fn poll(s: &mut Settings, _: f64, tx: &mut Tx) -> bool {
+    if let Some(loaded) = s.loading.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        s.loading = None;
+        if loaded.selected == s.selected { s.saved = loaded.saved; }
+        s.configured = loaded.configured;
+        return true;
+    }
     if s.asking.as_ref().is_some_and(|rx| rx.try_recv().is_ok()) {
         s.asking = None;
         s.load();
@@ -164,7 +223,7 @@ pub fn view(s: &Settings, cx: &mut Cx<Settings>) -> El {
         sidebar = sidebar.child(row().key(i.id).hit().gap(8.0).items_center().px(8.0).h(30.0).radius(7.0)
             .fill(if on { th.hover } else { Color::TRANSPARENT }).hover(th.hover)
             .on_press(move |s: &mut Settings| s.select(index))
-            .child(el().size(7.0, 7.0).radius(3.5).fill(if i.configured() { green } else { th.text_secondary.alpha(0.4) }))
+            .child(el().size(7.0, 7.0).radius(3.5).fill(if s.configured[index] { green } else { th.text_secondary.alpha(0.4) }))
             .child(text(i.name).font(t(13.0, if on { 600.0 } else { 500.0 })).color(th.text)));
     }
 
@@ -176,7 +235,9 @@ pub fn view(s: &Settings, cx: &mut Cx<Settings>) -> El {
         login => col().px(8.0).child(Switch::new(login != Login::Off).label("Open at login")
             .on_toggle(|s: &mut Settings| s.toggle_login()).build(&k).key("login")),
     };
-    sidebar = sidebar.child(spacer()).child(general)
+    let capture = col().px(8.0).child(Switch::new(s.in_capture).label("Show in screen sharing")
+        .on_toggle(|s: &mut Settings| s.toggle_capture()).build(&k).key("capture"));
+    sidebar = sidebar.child(spacer()).child(capture).child(general.pt(8.0))
         .child(text(format!("Version {}", env!("CARGO_PKG_VERSION"))).font(t(10.5, 500.0)).color(th.text_secondary.alpha(0.7)).px(8.0).pt(10.0));
 
     let i = s.integration();

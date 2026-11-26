@@ -3,7 +3,8 @@
 //! beside the notch says where that data comes from and holds the clock; the notch itself
 //! hides whatever is drawn behind it, so content starts below it.
 
-use chrono::{Duration, NaiveDateTime, NaiveTime};
+use chrono::{Duration, Timelike};
+use crate::time::Time;
 use rune::tok::TextStyle;
 use rune::{Color, Cx, El, ScrollSpec, Spring, Transition, Tx, col, el, row, spacer, text};
 
@@ -75,9 +76,11 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
     let body = if open { expanded(s) } else { collapsed(s, peek) };
     // Open, the panel is as tall as its section's content; the height springs with the width.
     let badges: f32 = alerts(s).iter().map(|(text, ..)| BADGE_WING + BADGE_CHAR * text.chars().count().saturating_sub(1) as f32).sum();
-    let wing = if peek.is_some() { PEEK_WING } else { WING + badges };
+    // Badges sit left of the notch, so only that wing grows for them; the margin keeps the notch
+    // centred. A wider right wing would cover more of the menu bar's icons for nothing.
+    let (left, right) = if peek.is_some() { (PEEK_WING, PEEK_WING) } else { (WING + badges, WING) };
     let height = s.geo.height + if peek.is_some() { PEEK_H } else { 0.0 };
-    let shape = if open { col().w(PANEL.0).max_h(PANEL.1) } else { col().size(s.geo.width + 2.0 * wing, height) };
+    let shape = if open { col().w(PANEL.0).max_h(PANEL.1) } else { col().size(s.geo.width + left + right, height).mr(left - right) };
     let island = shape.key("island").hit().fill(BLACK)
         .corners([0.0, 0.0, r, r]).clip_corners([0.0, 0.0, r, r])
         .shadow(10.0, if open { 40.0 } else { 0.0 }, BLACK.alpha(if open { 0.45 } else { 0.0 }))
@@ -194,6 +197,15 @@ fn source(s: &State, section: Section) -> (&Origin, &'static str, &'static str) 
     }
 }
 
+/// Live, but a part of it couldn't refresh: GitHub's notes say which.
+fn partly(s: &State, section: Section) -> bool {
+    section == Section::GitHub && matches!(s.github.data.origin, Origin::Live { .. }) && !s.github.data.trouble.is_empty()
+}
+
+fn status_color(s: &State, section: Section) -> Color {
+    if partly(s, section) { amber() } else { origin_color(source(s, section).0) }
+}
+
 fn origin_color(origin: &Origin) -> Color {
     match origin {
         Origin::Mock => amber(),
@@ -208,7 +220,9 @@ fn origin_color(origin: &Origin) -> Color {
 fn origin_label(s: &State) -> El {
     let (origin, _, id) = source(s, s.section);
     let now = s.snap.now;
+    let partly = partly(s, s.section);
     let text = match origin {
+        Origin::Live { .. } if partly => "Partly live".to_string(),
         Origin::Mock => "Mock data · Connect".to_string(),
         Origin::Loading => "Loading…".to_string(),
         // Each refreshes every five minutes or sooner, so the age only matters once a refresh was missed.
@@ -218,10 +232,10 @@ fn origin_label(s: &State) -> El {
         Origin::Error { stale: None, .. } => "Offline".to_string(),
     };
     let mut l = row().key("origin").shrink().gap(5.0).items_center().px(6.0).h(20.0).radius(10.0)
-        .child(el().size(6.0, 6.0).radius(3.0).fill(origin_color(origin)))
+        .child(el().size(6.0, 6.0).radius(3.0).fill(status_color(s, s.section)))
         .child(label(text, 11.0, 500.0, dim()).shrink().truncate());
     // Mock or failing: a click opens Settings to connect.
-    if matches!(origin, Origin::Mock | Origin::Error { .. }) {
+    if partly || matches!(origin, Origin::Mock | Origin::Error { .. }) {
         l = l.hit().hover(WHITE.alpha(0.1)).on_press(move |_: &mut State| crate::open_settings_for(id));
     }
     l
@@ -239,12 +253,12 @@ fn body_key(s: &State) -> &'static str {
 
 fn sidebar(s: &State) -> El {
     let item = |section: Section, key: &'static str, badge: Option<El>| {
-        let (origin, name, _) = source(s, section);
+        let (_, name, _) = source(s, section);
         let on = s.section == section;
         let mut r = row().key(key).hit().w_full().h(30.0).px(10.0).gap(8.0).items_center().radius(10.0)
             .fill(WHITE.alpha(if on { 0.12 } else { 0.0 })).hover(WHITE.alpha(0.07))
             .on_press(move |s: &mut State| s.section = section)
-            .child(el().size(6.0, 6.0).radius(3.0).fill(origin_color(origin)))
+            .child(el().size(6.0, 6.0).radius(3.0).fill(status_color(s, section)))
             .child(label(name, 12.5, if on { 600.0 } else { 500.0 }, if on { WHITE } else { dim() }))
             .child(spacer());
         if let Some(b) = badge { r = r.child(b); }
@@ -503,10 +517,18 @@ fn pull_list(s: &State) -> El {
     let switch = row().gap(2.0)
         .child(tab("view-yours", "Your pull requests", s.pulls == PullView::Yours, unread_yours(s), purple(), |s| s.pulls = PullView::Yours))
         .child(tab("view-reviews", "To review", s.pulls == PullView::Reviews, unread_reviews(s), purple(), |s| s.pulls = PullView::Reviews));
-    unread_list(key, switch, any_unread, State::mark_pulls_read, rows, empty)
+    let list = unread_list(key, switch, any_unread, State::mark_pulls_read, rows, empty);
+    let note = gh.data.trouble.first().map(|t| (t, amber())).or_else(|| gh.data.limits.first().map(|l| (l, dim())));
+    match note {
+        Some((note, color)) => col().w_full().gap(6.0).child(list)
+            .child(row().key("note").w_full().gap(6.0).items_center().px(2.0)
+                .child(el().size(6.0, 6.0).radius(3.0).fill(color))
+                .child(label(note, 11.0, 500.0, dim()).shrink().truncate())),
+        None => list,
+    }
 }
 
-fn pull_row(p: &Pull, unread: &[&Activity], now: NaiveDateTime) -> El {
+fn pull_row(p: &Pull, unread: &[&Activity], now: Time) -> El {
     let repo = p.repo.rsplit('/').next().unwrap_or(&p.repo);
     let place = format!("{repo} #{}", p.number);
     let detail = match (unread.last(), p.author.as_str()) {
@@ -554,7 +576,7 @@ fn ticket_list(s: &State) -> El {
     unread_list("list-linear", title, unread > 0, State::mark_issues_read, rows, "No open issues and nothing new")
 }
 
-fn ticket_row(t: &Ticket, unread: &[&Notice], now: NaiveDateTime) -> El {
+fn ticket_row(t: &Ticket, unread: &[&Notice], now: Time) -> El {
     let detail = match unread.last() {
         Some(n) => {
             let what = format!("{} · {} ago", n.headline, span(now - n.at));
@@ -597,7 +619,7 @@ fn answer(e: &agenda::Event) -> &'static str {
 }
 
 /// The meeting you're in, with its time left, or the next one today; Join opens its call.
-fn focus_card(day: &Day, now: NaiveDateTime) -> El {
+fn focus_card(day: &Day, now: Time) -> El {
     let c = card().w(FOCUS_W).key("focus");
     let Some(focus) = day.focus else {
         let mut c = c.child(caps("Rest of today")).child(label("No more meetings today", 15.0, 650.0, WHITE));
@@ -641,7 +663,7 @@ const DIVIDER: f32 = 18.0;
 const COMING_UP_H: f32 = 170.0;
 
 /// The rest of today's meetings, then tomorrow's.
-fn coming_up(day: &Day, now: NaiveDateTime) -> El {
+fn coming_up(day: &Day, now: Time) -> El {
     let mut rows: Vec<El> = day.later.iter().map(|e| event_row(e, now, true)).collect();
     let mut height = rows.len() as f32 * EVENT_ROW;
     if !day.tomorrow.is_empty() {
@@ -661,7 +683,7 @@ fn coming_up(day: &Day, now: NaiveDateTime) -> El {
     col().grow(1.0).min_w(0.0).child(list)
 }
 
-fn event_row(e: &agenda::Event, now: NaiveDateTime, today: bool) -> El {
+fn event_row(e: &agenda::Event, now: Time, today: bool) -> El {
     let color = rgb(e.color);
     let ongoing = e.covers(now);
     let sure = e.reply == Reply::Yes;
@@ -689,9 +711,14 @@ fn event_row(e: &agenda::Event, now: NaiveDateTime, today: bool) -> El {
 
 /// Today's meetings on one track, ended ones faded, with a line at now. It spans 08:00 to 19:00,
 /// widened to fit the meetings and the time.
-fn timeline(day: &Day, now: NaiveDateTime) -> El {
-    let midnight = now.date().and_time(NaiveTime::MIN);
-    let minute = |t: NaiveDateTime| (t - midnight).num_minutes().clamp(0, 24 * 60);
+fn timeline(day: &Day, now: Time) -> El {
+    // By the clock, not by time elapsed since midnight, so the hours line up on a clock-change day.
+    let today = now.date_naive();
+    let minute = |t: Time| match t.date_naive().cmp(&today) {
+        std::cmp::Ordering::Less => 0,
+        std::cmp::Ordering::Greater => 24 * 60,
+        std::cmp::Ordering::Equal => i64::from(t.time().num_seconds_from_midnight() / 60),
+    };
     let first = day.timed.iter().map(|e| minute(e.start)).chain([minute(now), 8 * 60]).min().unwrap_or(0) / 60 * 60;
     let last = (day.timed.iter().map(|e| minute(e.end)).chain([minute(now) + 1, 19 * 60]).max().unwrap_or(24 * 60) + 59) / 60 * 60;
     let x = |m: i64| (m - first) as f32 / (last - first).max(60) as f32 * BODY_W;

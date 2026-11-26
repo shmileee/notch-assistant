@@ -12,7 +12,7 @@
 //!   refresh reads the threads of pull requests with activity directly
 //!   (`GET /notifications/threads/{id}`), and the first one pages back to find them.
 //! - `POST /graphql`: your open pull requests and those closed in the last three days, each with
-//!   its last 15 comments, reviews, merges and closes and the reactions to them (`QUERY`). The
+//!   its last 20 comments, reviews, merges and closes and the reactions to them (`QUERY`). The
 //!   state of your open ones: whether GitHub would merge each now, their checks, and how many
 //!   reactions they and your latest comments have (`STATE`). The open pull requests waiting for
 //!   a review from you or a team of yours (`REVIEWS`).
@@ -22,9 +22,11 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
-use chrono::{DateTime, Local, NaiveDateTime, Utc};
+use chrono::{DateTime, Local, Utc};
+
+use crate::time::Time;
 use serde_json::{Value, json};
 
 use crate::integrations::{Field, FieldKind, Integration};
@@ -56,7 +58,7 @@ pub const INTEGRATION: Integration = Integration {
 /// How often to look at your notifications: GitHub's poll interval, unless it asks for longer.
 pub const EVERY: Duration = Duration::from_secs(60);
 /// How often each part refreshes when nothing calls for it sooner. With nothing happening that's
-/// about 50 GraphQL points an hour (`STATE` 1, `REVIEWS` 3, `QUERY` 19) of the 5,000 that the
+/// about 100 GraphQL points an hour (`STATE` 1, `REVIEWS` 3, `QUERY` 69) of the 5,000 that the
 /// token shares with anything else using it (gh, say).
 const STATE_EVERY: Duration = Duration::from_secs(5 * 60);
 const REVIEWS_EVERY: Duration = Duration::from_secs(10 * 60);
@@ -76,8 +78,11 @@ const THREAD_READS: usize = 10;
 const REVIEW_PAGES: usize = 3;
 /// The least time between refreshes of a part that notifications call for, so a burst of them
 /// costs one refresh. With it, and one page of requests to review, the panel spends at most
-/// about 450 GraphQL points an hour.
+/// about 1,450 GraphQL points an hour.
 const GAP: Duration = Duration::from_secs(3 * 60);
+/// The first retry of a part that failed. Each one after waits twice as long, up to the part's
+/// usual interval.
+const RETRY: Duration = Duration::from_secs(60);
 
 fn test() -> Result<String, String> {
     if crate::demo::on() {
@@ -85,29 +90,35 @@ fn test() -> Result<String, String> {
         return Ok("Connected as OP: 4 open pull requests and 3 to review, 4 with something unread".into());
     }
     let mut client = Client::from_settings().ok_or("No token saved")?;
-    let now = Local::now().naive_local();
+    let now = Local::now();
     let pulls = client.fetch(now)?;
     let open = pulls.list.iter().filter(|p| matches!(p.status, Status::Open | Status::Draft)).count();
     let read = ReadState::load(pulls::READ_FILE, now);
     let unread = unread_count(&pulls.list, &read) + unread_count(&pulls.reviews, &read);
     let mut message = format!("Connected as {}: {open} open pull requests and {} to review, {unread} with something unread",
         pulls.login, pulls.reviews.len());
-    for w in &pulls.warnings { message.push_str(". "); message.push_str(w); }
+    for w in &pulls.trouble { message.push_str(". "); message.push_str(w); }
     Ok(message)
 }
 
 pub struct Client {
     token: String,
     ignore: HashSet<String>,
-    agent: ureq::Agent,
+    agent: crate::net::Http,
     login: String,
     own: Vec<Pull>,
     reviews: Vec<Pull>,
+    reviews_loaded: bool,
+    /// Lists longer than the queries read: your open pull requests (by `QUERY` and by `STATE`),
+    /// the recently closed ones, and the requests to review.
+    own_cut: bool,
+    state_cut: bool,
+    reviews_cut: bool,
     /// From `STATE`, by pull request ID.
     states: HashMap<String, PullState>,
     /// Reaction counts from `STATE`, to see new reactions by.
     reactions: Option<Reactions>,
-    warnings: Vec<String>,
+    warned: Warned,
     /// Notification threads by pull request (`key`), as found so far.
     threads: HashMap<String, Thread>,
     /// The pull requests on page 1 at the last look: their read times are current.
@@ -115,18 +126,21 @@ pub struct Client {
     /// Page 1's ETag: GitHub answers a look with it `304` while nothing changed.
     etag: Option<String>,
     /// No look before this: GitHub's poll interval.
-    look_after: Option<Instant>,
-    /// Why the last look failed, if it did: then yours refresh every `BLIND_EVERY`.
+    look_after: Option<SystemTime>,
+    /// Why GitHub refused the last look, if it did.
     blind: Option<String>,
+    /// Why the last look failed otherwise (a rate limit, the network), if it did.
+    look_failed: Option<String>,
     /// The first read of threads paging back is done.
     paged: bool,
     /// When each part last refreshed.
     at: Ages,
     /// Parts that failed and are owed a refresh.
     owed: Plan,
+    failed: Failures,
     /// Rate limited: no GraphQL or REST calls before these.
-    graphql_after: Cell<Option<Instant>>,
-    rest_after: Cell<Option<Instant>>,
+    graphql_after: Cell<Option<SystemTime>>,
+    rest_after: Cell<Option<SystemTime>>,
     /// Since the last refresh: looks, GraphQL points, and REST calls that counted (not a `304`).
     looks: u32,
     points: Cell<u64>,
@@ -137,8 +151,8 @@ pub struct Client {
 struct Thread {
     id: String,
     /// When you last read it.
-    read: Option<NaiveDateTime>,
-    updated: Option<NaiveDateTime>,
+    read: Option<Time>,
+    updated: Option<Time>,
     /// Why you get it: author, review_requested, comment, ...
     reason: String,
     /// For reading the thread alone: unchanged, that's free.
@@ -153,7 +167,11 @@ struct PullState { merge: String, approved: bool, checks: Checks }
 struct Reactions { open: HashMap<String, u64>, comments: HashMap<String, u64> }
 
 #[derive(Default)]
-struct Ages { own: Option<Instant>, state: Option<Instant>, reviews: Option<Instant>, threads: Option<Instant> }
+struct Ages { own: Option<SystemTime>, state: Option<SystemTime>, reviews: Option<SystemTime>, threads: Option<SystemTime> }
+
+/// What each part's last answer warned of (organisations hidden behind SSO).
+#[derive(Default)]
+struct Warned { own: Vec<String>, state: Vec<String>, reviews: Vec<String> }
 
 /// What to refresh.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -166,25 +184,51 @@ impl std::ops::BitOr for Plan {
     }
 }
 
+#[derive(Default)]
+struct Failures { state: Option<Failed>, reviews: Option<Failed> }
+
+struct Failed { why: String, times: u32, retry: SystemTime }
+
+impl Failed {
+    fn again(last: Option<Failed>, why: String, every: Duration, now: SystemTime) -> Failed {
+        let times = last.map_or(1, |f| f.times + 1);
+        Failed { why, times, retry: now + RETRY.saturating_mul(2u32.saturating_pow(times - 1)).min(every) }
+    }
+}
+
+fn ready(failed: &Option<Failed>, now: SystemTime) -> bool { failed.as_ref().is_none_or(|f| f.retry <= now) }
+
+/// A call that failed. `refused` when GitHub said no for a reason other than a rate limit, which
+/// trying again won't change.
+struct Failure { message: String, refused: bool }
+
+impl From<Failure> for String { fn from(f: Failure) -> String { f.message } }
+
 impl Client {
     /// A client from the saved settings; `None` without a token.
     pub fn from_settings() -> Option<Self> {
         let token = INTEGRATION.value("token")?;
         let ignore = INTEGRATION.value("ignore").unwrap_or_default()
             .split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()).map(str::to_lowercase).collect();
-        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(20)).user_agent("notch-assistant").build();
-        Some(Client {
-            token, ignore, agent, login: String::new(), own: vec![], reviews: vec![], states: HashMap::new(), reactions: None,
-            warnings: vec![], threads: HashMap::new(), on_page: HashSet::new(), etag: None, look_after: None, blind: None,
-            paged: false, at: Ages::default(), owed: Plan::default(),
-            graphql_after: Cell::new(None), rest_after: Cell::new(None), looks: 0, points: Cell::new(0), calls: Cell::new(0),
-        })
+        let agent = crate::net::Http::new("api.github.com");
+        Some(Client::new(token, ignore, agent))
     }
 
-    fn call(&self, req: ureq::Request, body: Option<Value>) -> Result<ureq::Response, String> {
+    fn new(token: String, ignore: HashSet<String>, agent: crate::net::Http) -> Self {
+        Client {
+            token, ignore, agent, login: String::new(), own: vec![], reviews: vec![], reviews_loaded: false,
+            own_cut: false, state_cut: false, reviews_cut: false, states: HashMap::new(), reactions: None,
+            warned: Warned::default(), threads: HashMap::new(), on_page: HashSet::new(), etag: None,
+            look_after: None, blind: None, look_failed: None, paged: false, at: Ages::default(), owed: Plan::default(),
+            failed: Failures::default(), graphql_after: Cell::new(None), rest_after: Cell::new(None),
+            looks: 0, points: Cell::new(0), calls: Cell::new(0),
+        }
+    }
+
+    fn call(&self, req: ureq::Request, body: Option<Value>) -> Result<ureq::Response, Failure> {
         let graphql = body.is_some();
         let after = if graphql { &self.graphql_after } else { &self.rest_after };
-        if let Some(t) = after.get().filter(|t| Instant::now() < *t) { return Err(limited(t)); }
+        if let Some(t) = holding(after) { return Err(Failure { message: limited(t), refused: false }); }
         let req = req.set("Authorization", &format!("Bearer {}", self.token))
             .set("Accept", "application/vnd.github+json").set("X-GitHub-Api-Version", "2022-11-28");
         let result = match body { Some(b) => req.send_json(b), None => req.call() };
@@ -193,18 +237,12 @@ impl Client {
                 if !graphql && resp.status() != 304 { self.calls.set(self.calls.get() + 1); }
                 Ok(resp)
             }
-            Err(ureq::Error::Status(401, _)) => Err("token rejected (401): check it in Settings".into()),
-            Err(ureq::Error::Status(code @ (403 | 429), resp))
-                if code == 429 || resp.header("x-ratelimit-remaining") == Some("0") || resp.header("retry-after").is_some() => {
-                let t = retry_at(&resp);
-                after.set(Some(t));
-                Err(limited(t))
-            }
             Err(ureq::Error::Status(code, resp)) => {
-                let message = resp.into_json::<Value>().ok().and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string));
-                Err(format!("HTTP {code}{}", message.map(|m| format!(": {m}")).unwrap_or_default()))
+                let (failure, until) = refusal(code, resp);
+                if let Some(t) = until { after.set(Some(t)); }
+                Err(failure)
             }
-            Err(e) => Err(format!("network: {e}")),
+            Err(e) => Err(Failure { message: format!("network: {e}"), refused: false }),
         }
     }
 
@@ -247,34 +285,24 @@ impl Client {
     }
 
     /// Everything, whatever the notifications say.
-    pub fn fetch(&mut self, now: NaiveDateTime) -> Result<Pulls, String> {
+    pub fn fetch(&mut self, now: Time) -> Result<Pulls, String> {
         self.at = Ages::default();
+        self.failed = Failures::default();
         self.tick(now)
     }
 
     /// Looks at your notifications and refreshes what they say changed and what's due. Either way,
     /// what it returns is current as of `now`.
-    pub fn tick(&mut self, now: NaiveDateTime) -> Result<Pulls, String> {
-        if let Some(t) = self.graphql_after.get().filter(|t| Instant::now() < *t) { return Err(limited(t)); }
-        let page = if self.blind.is_none() || self.at.own.is_none_or(|t| t.elapsed() >= BLIND_EVERY) {
-            match self.look() {
-                Ok(page) => { self.blind = None; page }
-                Err(e) => {
-                    if self.blind.is_none() { eprintln!("github: notifications: {e}"); }
-                    self.blind = Some(e);
-                    None
-                }
-            }
+    pub fn tick(&mut self, now: Time) -> Result<Pulls, String> {
+        if let Some(t) = holding(&self.graphql_after) { return Err(limited(t)); }
+        let wall = SystemTime::now();
+        let page = if self.blind.is_none() || self.at.own.is_none_or(|t| ago(t, wall) >= BLIND_EVERY) {
+            let result = self.look();
+            self.looked(result)
         } else { None };
         let changed = page.as_ref().map(|p| changes(&self.threads, p)).unwrap_or_default();
         let called = self.owed | triggers(&changed, &keys(&self.own), &keys(&self.reviews));
-        self.owed = Plan::default();
-        let soon = |at: Option<Instant>| at.is_some_and(|t| t.elapsed() < GAP);
-        let mut plan = self.due();
-        plan.own |= called.own && !soon(self.at.own);
-        plan.reviews |= called.reviews && !soon(self.at.reviews);
-        self.owed.own = called.own && !plan.own;
-        self.owed.reviews = called.reviews && !plan.reviews;
+        let mut plan = self.plan(called, wall);
         if let Some(page) = page {
             self.on_page = page.iter().map(|(k, _)| k.clone()).collect();
             for (k, t) in page {
@@ -283,7 +311,7 @@ impl Client {
             }
         }
         if plan.state && self.refresh_state() {
-            if soon(self.at.own) { self.owed.own = true; } else { plan.own = true; }
+            if soon(self.at.own, wall) { self.owed.own = true; } else { plan.own = true; }
         }
         if plan.own && let Err(e) = self.refresh_own(now) {
             self.owed.own = true;
@@ -297,10 +325,22 @@ impl Client {
         Ok(self.pulls(now))
     }
 
+    /// What to refresh now: what's due, and what `called` for unless it refreshed moments ago or
+    /// failed and waits to retry. What waits is owed.
+    fn plan(&mut self, called: Plan, now: SystemTime) -> Plan {
+        let mut plan = self.due(now);
+        plan.own |= called.own && !soon(self.at.own, now);
+        plan.reviews |= called.reviews && !soon(self.at.reviews, now);
+        plan.state &= ready(&self.failed.state, now);
+        plan.reviews &= ready(&self.failed.reviews, now);
+        self.owed = Plan { own: called.own && !plan.own, reviews: called.reviews && !plan.reviews, ..Plan::default() };
+        plan
+    }
+
     /// The parts whose time has come.
-    fn due(&self) -> Plan {
-        let after = |at: Option<Instant>, every: Duration| at.is_none_or(|t| t.elapsed() >= every);
-        let blind = self.blind.is_some();
+    fn due(&self, now: SystemTime) -> Plan {
+        let after = |at: Option<SystemTime>, every: Duration| at.is_none_or(|t| ago(t, now) >= every);
+        let blind = self.unnotified();
         Plan {
             own: after(self.at.own, if blind { BLIND_EVERY } else { OWN_EVERY }),
             state: after(self.at.state, STATE_EVERY),
@@ -309,20 +349,48 @@ impl Client {
         }
     }
 
+    /// Notifications don't say what changed: GitHub refuses them, or they're failing for now. Then
+    /// yours and the requests to review refresh every `BLIND_EVERY`.
+    fn unnotified(&self) -> bool { self.blind.is_some() || self.look_failed.is_some() }
+
     /// Page 1 of your notifications as threads by `key`, or `None` if it hasn't changed since the
     /// last look.
-    fn look(&mut self) -> Result<Option<Vec<(String, Thread)>>, String> {
-        if self.look_after.is_some_and(|t| Instant::now() < t) { return Ok(None); }
+    fn look(&mut self) -> Result<Option<Vec<(String, Thread)>>, Failure> {
+        if self.look_after.is_some_and(|t| SystemTime::now() < t) { return Ok(None); }
         let mut req = self.agent.get(&format!("{API}/notifications?all=true&participating=true&per_page={PER_PAGE}"));
         if let Some(e) = &self.etag { req = req.set("If-None-Match", e); }
         let resp = self.call(req, None)?;
+        self.take_look(resp).map_err(|message| Failure { message, refused: false })
+    }
+
+    /// Takes in a look's result. Only GitHub refusing the notifications makes it blind: a rate
+    /// limit or the network says nothing about the token.
+    fn looked(&mut self, result: Result<Option<Vec<(String, Thread)>>, Failure>) -> Option<Vec<(String, Thread)>> {
+        match result {
+            Ok(page) => { self.blind = None; self.look_failed = None; page }
+            Err(f) if f.refused => {
+                if self.blind.is_none() { eprintln!("github: notifications: {}", f.message); }
+                self.blind = Some(f.message);
+                self.look_failed = None;
+                None
+            }
+            Err(f) => {
+                if self.look_failed.is_none() { eprintln!("github: notifications: {}", f.message); }
+                self.look_failed = Some(f.message);
+                None
+            }
+        }
+    }
+
+    fn take_look(&mut self, resp: ureq::Response) -> Result<Option<Vec<(String, Thread)>>, String> {
         // Less a little, so a tick that comes a moment early doesn't skip a whole interval.
         let poll = resp.header("x-poll-interval").and_then(|s| s.parse().ok()).unwrap_or(0);
-        self.look_after = Some(Instant::now() + Duration::from_secs(poll).saturating_sub(Duration::from_secs(5)));
+        self.look_after = Some(SystemTime::now() + Duration::from_secs(poll).saturating_sub(Duration::from_secs(5)));
         if resp.status() == 304 { return Ok(None); }
-        let first = self.etag.is_none();
-        self.etag = resp.header("etag").map(str::to_string);
+        let etag = resp.header("etag").map(str::to_string);
         let page: Value = resp.into_json().map_err(|e| format!("notifications: bad JSON ({e})"))?;
+        let first = self.etag.is_none();
+        self.etag = etag;
         let threads: Vec<_> = page.as_array().into_iter().flatten().filter_map(thread).collect();
         if first {
             // Nothing to compare the first page with: take it as what's seen, not as news.
@@ -334,7 +402,7 @@ impl Client {
     }
 
     /// Your pull requests, with their activity.
-    fn refresh_own(&mut self, now: NaiveDateTime) -> Result<(), String> {
+    fn refresh_own(&mut self, now: Time) -> Result<(), String> {
         let mut warnings = vec![];
         let since = (now - chrono::Duration::days(3)).format("%Y-%m-%d");
         let variables = json!({
@@ -342,6 +410,11 @@ impl Client {
             "closed": format!("is:pr is:closed author:@me archived:false updated:>={since} sort:updated-desc"),
         });
         let data = self.graphql(QUERY, variables, &mut warnings)?;
+        self.take_own(&data, warnings);
+        Ok(())
+    }
+
+    fn take_own(&mut self, data: &Value, warnings: Vec<String>) {
         self.login = str_at(&data["viewer"], "login").unwrap_or_default().to_string();
         let who = Who { me: self.login.to_lowercase(), ignore: &self.ignore };
         let own = ["open", "closed"].iter()
@@ -349,20 +422,29 @@ impl Client {
             .filter_map(|n| pull(&n, &who))
             .collect();
         self.own = own;
-        self.warnings = warnings;
-        self.at.own = Some(Instant::now());
-        Ok(())
+        self.own_cut = data["open"]["pageInfo"]["hasNextPage"] == json!(true);
+        self.warned.own = warnings;
+        self.at.own = Some(SystemTime::now());
     }
 
     /// Updates `states` and `reactions`; true when yours need refreshing (see `reacted`). On failure
     /// the last ones stand: a refresh is no reason to go offline.
     fn refresh_state(&mut self) -> bool {
         let q = "is:pr is:open author:@me archived:false sort:updated-desc";
-        let data = match self.graphql(STATE, json!({ "q": q }), &mut vec![]) {
-            Ok(data) => data,
-            Err(e) => { eprintln!("github: state: {e}"); return false; }
-        };
-        self.at.state = Some(Instant::now());
+        let mut warnings = vec![];
+        match self.graphql(STATE, json!({ "q": q }), &mut warnings) {
+            Ok(data) => { self.failed.state = None; self.warned.state = warnings; self.take_state(&data) }
+            Err(e) => {
+                eprintln!("github: state: {e}");
+                self.failed.state = Some(Failed::again(self.failed.state.take(), e, STATE_EVERY, SystemTime::now()));
+                false
+            }
+        }
+    }
+
+    fn take_state(&mut self, data: &Value) -> bool {
+        self.at.state = Some(SystemTime::now());
+        self.state_cut = data["search"]["pageInfo"]["hasNextPage"] == json!(true);
         let open: Vec<&Value> = data["search"]["nodes"].as_array().into_iter().flatten().collect();
         self.states = open.iter().filter_map(|n| Some((str_at(n, "id")?.to_string(), PullState {
             merge: str_at(n, "mergeStateStatus").unwrap_or_default().to_string(),
@@ -384,50 +466,63 @@ impl Client {
     /// Updates the requests to review; on failure the last ones stand.
     fn refresh_reviews(&mut self) {
         let who = Who { me: self.login.to_lowercase(), ignore: &self.ignore };
-        match self.fetch_reviews(&who, &mut vec![]) {
-            Ok(found) => self.reviews = found,
-            Err(e) => { eprintln!("github: requests to review: {e}"); self.owed.reviews = true; return; }
+        let mut warnings = vec![];
+        match self.fetch_reviews(&who, &mut warnings) {
+            Ok((found, cut)) => {
+                self.reviews = found;
+                self.reviews_cut = cut;
+                self.reviews_loaded = true;
+                self.failed.reviews = None;
+                self.warned.reviews = warnings;
+                self.at.reviews = Some(SystemTime::now());
+            }
+            Err(e) => {
+                eprintln!("github: requests to review: {e}");
+                self.owed.reviews = true;
+                let every = if self.unnotified() { BLIND_EVERY } else { REVIEWS_EVERY };
+                self.failed.reviews = Some(Failed::again(self.failed.reviews.take(), e, every, SystemTime::now()));
+            }
         }
-        self.at.reviews = Some(Instant::now());
     }
 
     /// Pull requests waiting for your review or a team's, a page at a time. One updated between
     /// pages can come twice. Renovate and Dependabot, the bots that ask most, are left out of the
-    /// search so it fits a page; other bots are dropped after it.
-    fn fetch_reviews(&self, who: &Who, warnings: &mut Vec<String>) -> Result<Vec<Pull>, String> {
+    /// search so it fits a page; other bots are dropped after it. True with them when there are
+    /// more pages than it reads.
+    fn fetch_reviews(&self, who: &Who, warnings: &mut Vec<String>) -> Result<(Vec<Pull>, bool), String> {
         let q = "is:pr is:open draft:false archived:false review-requested:@me -author:app/renovate -author:app/dependabot sort:updated-desc";
         let (mut reviews, mut seen, mut after) = (vec![], HashSet::new(), Value::Null);
         for _ in 0..REVIEW_PAGES {
             let data = self.graphql(REVIEWS, json!({ "q": q, "after": after }), warnings)?;
             let search = &data["search"];
             reviews.extend(search["nodes"].as_array().into_iter().flatten().filter_map(|n| review(n, who)).filter(|p| seen.insert(p.id.clone())));
-            if search["pageInfo"]["hasNextPage"] != json!(true) { break; }
+            if search["pageInfo"]["hasNextPage"] != json!(true) { return Ok((reviews, false)); }
             after = search["pageInfo"]["endCursor"].clone();
         }
-        Ok(reviews)
+        Ok((reviews, true))
     }
 
     /// Brings read times up to date for pull requests with activity: the first time by paging
     /// back to find their threads, then by reading each thread that has dropped off page 1,
     /// unless you'd already read it past its newest activity.
     fn read_threads(&mut self) {
-        self.at.threads = Some(Instant::now());
-        let mut active: Vec<(String, NaiveDateTime, bool)> = self.own.iter().chain(&self.reviews)
+        self.at.threads = Some(SystemTime::now());
+        let mut active: Vec<(String, Time, bool)> = self.own.iter().chain(&self.reviews)
             .filter_map(|p| Some((key(&p.repo, p.number), p.activity.last()?.at, p.counts()))).collect();
         active.sort_by_key(|(_, newest, _)| std::cmp::Reverse(*newest));
         if !self.paged {
+            self.paged = true;
             for page in 2..=FIRST_PAGES {
                 // A team's request often has no thread to find, so the paging back doesn't wait for one.
                 if active.iter().filter(|a| a.2).all(|(k, ..)| self.threads.contains_key(k)) { break; }
                 let threads = match self.rest(&format!("/notifications?all=true&participating=true&per_page={PER_PAGE}&page={page}")) {
                     Ok(v) => v.as_array().cloned().unwrap_or_default(),
-                    Err(e) => { eprintln!("github: notifications page {page}: {e}"); break; }
+                    Err(e) => { eprintln!("github: notifications page {page}: {e}"); self.paged = false; break; }
                 };
                 let full = threads.len() == PER_PAGE;
                 for (k, t) in threads.iter().filter_map(thread) { self.threads.entry(k).or_insert(t); }
                 if !full { break; }
             }
-            self.paged = true;
         }
         let mut reads = 0;
         for (k, newest, _) in &active {
@@ -452,7 +547,7 @@ impl Client {
     }
 
     /// What the panel shows: the latest of each part, with the state and read times laid over.
-    fn pulls(&self, now: NaiveDateTime) -> Pulls {
+    fn pulls(&self, now: Time) -> Pulls {
         let read = |p: &Pull| Pull { read_on_github: self.threads.get(&key(&p.repo, p.number)).and_then(|t| t.read), ..p.clone() };
         let own = self.own.iter().map(|p| {
             let mut p = read(p);
@@ -464,11 +559,24 @@ impl Client {
             }
             p
         }).collect();
-        let mut warnings = self.warnings.clone();
-        if let Some(e) = &self.blind {
-            warnings.push(format!("GitHub's notifications aren't readable with this token ({e}), so only opening a pull request from the panel marks it read"));
+        let mut trouble = vec![];
+        if let Some(f) = &self.failed.reviews { trouble.push(format!("To review couldn't refresh: {}", f.why)); }
+        if let Some(f) = &self.failed.state { trouble.push(format!("Checks and merge state couldn't refresh: {}", f.why)); }
+        if let Some(e) = &self.look_failed { trouble.push(format!("Notifications couldn't refresh: {e}")); }
+        // The recently closed list is a courtesy: one past its ten only loses an old merge.
+        let mut limits = vec![];
+        if self.own_cut || self.state_cut { limits.push("Showing the 100 most recently updated of your open pull requests".to_string()); }
+        if self.reviews_cut { limits.push(format!("Showing the {} most recently updated requests to review", REVIEW_PAGES * 100)); }
+        for w in self.warned.own.iter().chain(&self.warned.state).chain(&self.warned.reviews) {
+            if !trouble.contains(w) { trouble.push(w.clone()); }
         }
-        Pulls { login: self.login.clone(), list: own, reviews: self.reviews.iter().map(read).collect(), origin: Origin::Live { at: now }, warnings }
+        if let Some(e) = &self.blind {
+            trouble.push(format!("GitHub's notifications aren't readable with this token ({e}), so only opening a pull request from the panel marks it read"));
+        }
+        Pulls {
+            login: self.login.clone(), list: own, reviews: self.reviews.iter().map(read).collect(), reviews_loaded: self.reviews_loaded,
+            origin: Origin::Live { at: now }, trouble, limits,
+        }
     }
 }
 
@@ -504,11 +612,36 @@ fn reacted(before: &Reactions, now: &Reactions) -> bool {
 
 fn keys(list: &[Pull]) -> HashSet<String> { list.iter().map(|p| key(&p.repo, p.number)).collect() }
 
+fn soon(at: Option<SystemTime>, now: SystemTime) -> bool { at.is_some_and(|t| ago(t, now) < GAP) }
+
+/// Wall-clock time since `t`, which keeps counting while the Mac sleeps, unlike `Instant`. A clock
+/// set back makes it long ago, so a part refreshes rather than waits out the jump.
+fn ago(t: SystemTime, now: SystemTime) -> Duration { now.duration_since(t).unwrap_or(Duration::MAX) }
+
+/// Why GitHub refused a call, and until when if it was a rate limit. A secondary limit can come
+/// as a bare 403 that says so only in its message.
+fn refusal(code: u16, resp: ureq::Response) -> (Failure, Option<SystemTime>) {
+    if code == 401 { return (Failure { message: "token rejected (401): check it in Settings".into(), refused: true }, None); }
+    let retry = retry_at(&resp);
+    let headers = resp.header("x-ratelimit-remaining") == Some("0") || resp.header("retry-after").is_some();
+    let message = resp.into_json::<Value>().ok().and_then(|v| str_at(&v, "message").map(str::to_string));
+    let says = message.as_deref().is_some_and(|m| ["rate limit", "abuse"].iter().any(|s| m.to_lowercase().contains(s)));
+    if code == 429 || (code == 403 && (headers || says)) {
+        return (Failure { message: limited(retry), refused: false }, Some(retry));
+    }
+    let message = format!("HTTP {code}{}", message.map(|m| format!(": {m}")).unwrap_or_default());
+    (Failure { message, refused: (400..500).contains(&code) }, None)
+}
+
 /// When a rate-limited response says to try again: `retry-after`, else when the budget resets,
 /// else in a minute.
-fn retry_at(resp: &ureq::Response) -> Instant {
-    Instant::now() + Duration::from_secs(wait(resp.header("retry-after"), resp.header("x-ratelimit-remaining"), resp.header("x-ratelimit-reset"), Utc::now().timestamp()))
+fn retry_at(resp: &ureq::Response) -> SystemTime {
+    SystemTime::now() + Duration::from_secs(wait(resp.header("retry-after"), resp.header("x-ratelimit-remaining"), resp.header("x-ratelimit-reset"), Utc::now().timestamp()))
 }
+
+/// When the rate limit in `after` ends, if it hasn't yet. Wall-clock time, because `Instant` stops
+/// while the Mac sleeps, so after sleeping past the reset it would still wait out the rest.
+fn holding(after: &Cell<Option<SystemTime>>) -> Option<SystemTime> { after.get().filter(|t| SystemTime::now() < *t) }
 
 fn wait(retry_after: Option<&str>, remaining: Option<&str>, reset: Option<&str>, now: i64) -> u64 {
     if let Some(secs) = retry_after.and_then(|s| s.parse().ok()) { return secs; }
@@ -518,9 +651,8 @@ fn wait(retry_after: Option<&str>, remaining: Option<&str>, reset: Option<&str>,
     }
 }
 
-fn limited(until: Instant) -> String {
-    let at = Local::now() + chrono::Duration::from_std(until.saturating_duration_since(Instant::now())).unwrap_or_default();
-    format!("rate limited until {}, as GitHub asks", at.format("%H:%M"))
+fn limited(until: SystemTime) -> String {
+    format!("rate limited until {}, as GitHub asks", DateTime::<Local>::from(until).format("%H:%M"))
 }
 
 /// A notification thread's pull request and what it says. A thread marked read without a read
@@ -580,7 +712,7 @@ fn pull(n: &Value, who: &Who) -> Option<Pull> {
     for item in n["timelineItems"]["nodes"].as_array().into_iter().flatten() {
         let item_url = str_at(item, "url").unwrap_or(&url);
         let text = excerpt(str_at(item, "bodyText").unwrap_or_default());
-        let mut push = |actor: &Value, at: Option<NaiveDateTime>, kind: Kind, excerpt: String, url: &str| {
+        let mut push = |actor: &Value, at: Option<Time>, kind: Kind, excerpt: String, url: &str| {
             if let (Some((name, true)), Some(at)) = (who.of(actor), at) {
                 activity.push(Activity { who: name, at, kind, excerpt, url: url.into() });
             }
@@ -722,15 +854,17 @@ fn excerpt(text: &str) -> String {
 
 fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> { v.get(key).and_then(Value::as_str) }
 
-fn time_at(v: &Value, key: &str) -> Option<NaiveDateTime> {
-    DateTime::parse_from_rfc3339(str_at(v, key)?).ok().map(|t| t.with_timezone(&Local).naive_local())
+fn time_at(v: &Value, key: &str) -> Option<Time> {
+    DateTime::parse_from_rfc3339(str_at(v, key)?).ok().map(|t| t.with_timezone(&Local))
 }
 
+/// Your own and bots' timeline items take slots before they're dropped, hence 20. Each 5 more
+/// cost about 16 points a run.
 const QUERY: &str = r#"
 query($open: String!, $closed: String!) {
   viewer { login }
   rateLimit { cost }
-  open: search(query: $open, type: ISSUE, first: 30) { nodes { ...pull } }
+  open: search(query: $open, type: ISSUE, first: 100) { pageInfo { hasNextPage } nodes { ...pull } }
   closed: search(query: $closed, type: ISSUE, first: 10) { nodes { ...pull } }
 }
 fragment actor on Actor { login __typename ... on User { name } }
@@ -742,7 +876,7 @@ fragment pull on PullRequest {
   repository { nameWithOwner }
   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
   ...reactions
-  timelineItems(last: 15, itemTypes: [ISSUE_COMMENT, PULL_REQUEST_REVIEW, MERGED_EVENT, CLOSED_EVENT, REOPENED_EVENT]) {
+  timelineItems(last: 20, itemTypes: [ISSUE_COMMENT, PULL_REQUEST_REVIEW, MERGED_EVENT, CLOSED_EVENT, REOPENED_EVENT]) {
     nodes {
       __typename
       ... on IssueComment { url createdAt bodyText author { ...actor } ...reactions }
@@ -762,7 +896,8 @@ const STATE: &str = r#"
 query($q: String!) {
   rateLimit { cost }
   viewer { issueComments(last: 20) { nodes { id reactions { totalCount } } } }
-  search(query: $q, type: ISSUE, first: 30) {
+  search(query: $q, type: ISSUE, first: 100) {
+    pageInfo { hasNextPage }
     nodes {
       ... on PullRequest {
         id mergeStateStatus reactions { totalCount }
@@ -801,9 +936,9 @@ impl Client {
     pub fn fetcher(mut self) -> impl FnMut() -> Result<Pulls, String> + Send + 'static {
         let mut warned = false;
         move || {
-            let result = self.tick(Local::now().naive_local());
+            let result = self.tick(Local::now());
             if let (Ok(p), false) = (&result, warned) {
-                for w in &p.warnings { eprintln!("github: {w}"); }
+                for w in &p.trouble { eprintln!("github: {w}"); }
                 warned = true;
             }
             result
@@ -912,7 +1047,7 @@ mod tests {
 
     #[test]
     fn only_a_change_to_what_is_listed_refreshes_it() {
-        let at = |h: u32| NaiveDateTime::parse_from_str(&format!("2026-11-10 {h:02}:00"), "%Y-%m-%d %H:%M").ok();
+        let at = |h: u32| Some(crate::time::at(2026, 11, 10, h, 0));
         let t = |updated: u32, read: Option<u32>, reason: &str| Thread { updated: at(updated), read: read.and_then(at), reason: reason.into(), ..Default::default() };
         let seen = HashMap::from([
             ("o/r#1".to_string(), t(9, None, "author")),
@@ -953,5 +1088,166 @@ mod tests {
         assert_eq!(wait(Some("30"), Some("0"), Some("1000"), 900), 30, "retry-after first");
         assert_eq!(wait(None, Some("0"), Some("1000"), 900), 101, "then the budget's reset");
         assert_eq!(wait(None, Some("12"), Some("1000"), 900), 60, "a secondary limit without either");
+    }
+
+    fn client() -> Client { Client::new("t".into(), HashSet::new(), crate::net::Http::new("api.github.com")) }
+
+    fn response(head: &str, body: &str) -> ureq::Response { format!("{head}\r\n\r\n{body}").parse().unwrap() }
+
+    fn noon() -> Time { crate::time::at(2026, 11, 10, 12, 0) }
+
+    #[test]
+    fn a_failed_part_retries_after_a_minute_then_twice_as_long_up_to_its_interval() {
+        let now = SystemTime::now();
+        let (mut last, mut minutes) = (None, vec![]);
+        for _ in 0..5 {
+            let f = Failed::again(last, "HTTP 502".into(), STATE_EVERY, now);
+            minutes.push(f.retry.duration_since(now).unwrap().as_secs() / 60);
+            last = Some(f);
+        }
+        assert_eq!(minutes, [1, 2, 4, 5, 5]);
+    }
+
+    #[test]
+    fn a_part_waiting_to_retry_is_left_out_and_owed() {
+        let mut c = client();
+        let now = SystemTime::now();
+        let failed = || Some(Failed { why: "HTTP 502".into(), times: 1, retry: now + RETRY });
+        c.failed = Failures { state: failed(), reviews: failed() };
+        let plan = c.plan(Plan { reviews: true, ..Plan::default() }, now);
+        assert_eq!(plan, Plan { own: true, threads: true, ..Plan::default() }, "state and reviews are due but wait");
+        assert!(c.owed.reviews, "called for, so owed");
+        let plan = c.plan(c.owed, now + RETRY);
+        assert!(plan.state && plan.reviews);
+    }
+
+    #[test]
+    fn a_part_that_fails_keeps_its_last_data_and_says_why() {
+        let mut c = client();
+        assert!(!c.pulls(noon()).reviews_loaded);
+        let who = Who { me: "op".into(), ignore: &HashSet::new() };
+        c.reviews = vec![pull(&json!({"id": "PR_1", "number": 7, "url": "u", "repository": {"nameWithOwner": "o/r"}}), &who).unwrap()];
+        c.reviews_loaded = true;
+        c.graphql_after.set(Some(SystemTime::now() + Duration::from_secs(600)));
+        c.refresh_reviews();
+        assert!(!c.refresh_state());
+        let p = c.pulls(noon());
+        assert_eq!((p.reviews.len(), p.reviews_loaded), (1, true), "the last good list stays");
+        assert!(p.trouble[0].starts_with("To review couldn't refresh: rate limited until "), "{:?}", p.trouble);
+        assert!(p.trouble[1].starts_with("Checks and merge state couldn't refresh: rate limited until "), "{:?}", p.trouble);
+        c.refresh_reviews();
+        assert_eq!(c.failed.reviews.map(|f| f.times), Some(2));
+    }
+
+    #[test]
+    fn a_list_cut_short_says_so_once() {
+        let mut c = client();
+        let page = |more: bool| json!({"pageInfo": {"hasNextPage": more}, "nodes": []});
+        let own = |more: bool| json!({"viewer": {"login": "op"}, "open": page(more), "closed": page(false)});
+        let cut = |c: &Client| c.pulls(noon()).limits.iter().filter(|t| t.starts_with("Showing the 100 most recently updated")).count();
+        c.take_own(&own(true), vec![]);
+        c.take_state(&json!({"search": page(true)}));
+        assert_eq!(cut(&c), 1);
+        c.take_own(&own(false), vec![]);
+        assert_eq!(cut(&c), 1, "the state query still finds more");
+        c.take_state(&json!({"search": page(false)}));
+        assert_eq!(cut(&c), 0);
+
+        c.take_own(&json!({"viewer": {"login": "op"}, "open": page(false), "closed": page(true)}), vec![]);
+        c.reviews_cut = true;
+        assert_eq!(c.pulls(noon()).limits, ["Showing the 300 most recently updated requests to review"]);
+        assert!(c.pulls(noon()).trouble.is_empty(), "a limit isn't trouble");
+    }
+
+    #[test]
+    fn a_part_is_due_once_its_wall_clock_interval_passed() {
+        let mut c = client();
+        let now = SystemTime::now();
+        let ago = |secs: u64| Some(now - Duration::from_secs(secs));
+        c.at = Ages { own: ago(0), state: ago(STATE_EVERY.as_secs() - 1), reviews: ago(8 * 3600), threads: Some(now + Duration::from_secs(3600)) };
+        assert_eq!(c.due(now), Plan { reviews: true, threads: true, ..Plan::default() }, "after a night's sleep, and with the clock set back");
+        assert!(c.due(now + Duration::from_secs(1)).state);
+        c.at = Ages { own: ago(8 * 3600), state: ago(8 * 3600), reviews: ago(8 * 3600), threads: ago(8 * 3600) };
+        assert_eq!(c.due(now), Plan { own: true, state: true, reviews: true, threads: true });
+    }
+
+    #[test]
+    fn failing_notifications_refresh_yours_and_the_requests_to_review_sooner() {
+        let mut c = client();
+        let now = SystemTime::now();
+        let then = Some(now - BLIND_EVERY);
+        c.at = Ages { own: then, state: then, reviews: then, threads: then };
+        assert_eq!(c.due(now), Plan::default());
+        c.look_failed = Some("network: timed out".into());
+        assert_eq!(c.due(now), Plan { own: true, reviews: true, ..Plan::default() });
+    }
+
+    #[test]
+    fn paging_back_that_fails_is_tried_again() {
+        let mut c = client();
+        let who = Who { me: "op".into(), ignore: &HashSet::new() };
+        let comment = json!({"__typename": "IssueComment", "url": "u", "createdAt": "2026-11-10T09:00:00Z", "bodyText": "hi", "author": {"login": "xv", "__typename": "User"}});
+        c.own = vec![pull(&json!({"id": "PR_1", "number": 7, "url": "u", "repository": {"nameWithOwner": "o/r"}, "timelineItems": {"nodes": [comment]}}), &who).unwrap()];
+        c.rest_after.set(Some(SystemTime::now() + Duration::from_secs(60)));
+        c.read_threads();
+        assert!(!c.paged);
+    }
+
+    #[test]
+    fn sso_warnings_from_every_part_show_once() {
+        let mut c = client();
+        let sso = "Some organizations hide their pull requests until you authorize the token for SSO".to_string();
+        c.warned = Warned { own: vec![], state: vec![sso.clone()], reviews: vec![sso.clone()] };
+        assert_eq!(c.pulls(noon()).trouble, [sso]);
+    }
+
+    #[test]
+    fn only_github_refusing_the_notifications_makes_it_blind() {
+        let mut c = client();
+        c.rest_after.set(Some(SystemTime::now() + Duration::from_secs(60)));
+        let result = c.look();
+        assert!(c.looked(result).is_none());
+        assert_eq!(c.blind, None, "a rate limit says nothing about the token");
+        assert!(c.pulls(noon()).trouble[0].starts_with("Notifications couldn't refresh: rate limited until "));
+        c.looked(Err(Failure { message: "HTTP 403: Resource not accessible by personal access token".into(), refused: true }));
+        let p = c.pulls(noon());
+        assert!(p.trouble[0].starts_with("GitHub's notifications aren't readable with this token (HTTP 403"), "{:?}", p.trouble);
+        assert_eq!(p.trouble.len(), 1);
+        c.looked(Ok(None));
+        assert!(c.pulls(noon()).trouble.is_empty());
+    }
+
+    #[test]
+    fn the_etag_is_kept_only_once_its_page_is_read() {
+        let mut c = client();
+        let page = |body: &str| response("HTTP/1.1 200 OK\r\nETag: \"v2\"", body);
+        assert!(c.take_look(page(r#"[{"id": "#)).is_err());
+        assert_eq!(c.etag, None, "kept, the next look would get a 304 and miss what this page said");
+        assert_eq!(c.take_look(page("[]")), Ok(None), "the first page is what's seen, not news");
+        assert_eq!(c.etag.as_deref(), Some("\"v2\""));
+    }
+
+    #[test]
+    fn a_bare_403_that_mentions_a_rate_limit_is_one() {
+        let refused = |code: u16, message: &str| refusal(code, response(&format!("HTTP/1.1 {code} X"), &json!({"message": message}).to_string()));
+        let in_a_minute = |until: Option<SystemTime>| until.and_then(|t| t.duration_since(SystemTime::now()).ok()).is_some_and(|d| d.as_secs().abs_diff(60) <= 2);
+        for m in ["You have exceeded a secondary rate limit. Please wait a few minutes.", "You have triggered an abuse detection mechanism."] {
+            let (f, until) = refused(403, m);
+            assert!(in_a_minute(until) && !f.refused, "{m}");
+        }
+        let (f, until) = refused(403, "Resource not accessible by personal access token");
+        assert_eq!((f.message.as_str(), f.refused, until), ("HTTP 403: Resource not accessible by personal access token", true, None));
+        let (f, until) = refused(502, "Server Error");
+        assert!(!f.refused && until.is_none(), "GitHub having a bad moment");
+    }
+
+    #[test]
+    fn a_rate_limit_lasts_until_the_wall_clock_reset() {
+        let reset = Utc::now().timestamp() + 100;
+        let (_, until) = refusal(403, response(&format!("HTTP/1.1 403 X\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: {reset}"), "{}"));
+        let at = until.unwrap().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64;
+        assert!((at - (reset + 1)).abs() <= 1, "{at} vs {reset}");
+        assert_eq!(holding(&Cell::new(until)), until);
+        assert_eq!(holding(&Cell::new(Some(SystemTime::now() - Duration::from_secs(1)))), None, "a reset that passed while the Mac slept");
     }
 }

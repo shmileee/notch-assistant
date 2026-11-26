@@ -5,14 +5,16 @@
 //! - `GET /v1/teams/{team}/on_call_schedules?shift_time_window_start=…&shift_time_window_end=…`:
 //!   the team's Signals schedules with the shifts overlapping that window. A schedule whose
 //!   name contains "secondary" is the secondary rotation; the rest are primary.
-//! - `GET /v1/incidents?teams={team}`: incidents, keeping the active ones.
+//! - `GET /v1/incidents?teams={team}&page=…`: incidents, page by page up to `MAX_PAGES`, keeping
+//!   the active ones.
 //!
 //! Settings (`INTEGRATION`): the API key (Keychain), the team ID and your name on the schedule.
 
 use std::collections::HashSet;
 use std::time::Duration;
 
-use chrono::{DateTime, Local, NaiveDateTime};
+use chrono::{DateTime, Local};
+use crate::time::{self, Time};
 use serde_json::Value;
 
 use crate::integrations::{Field, FieldKind, Integration};
@@ -46,7 +48,7 @@ fn test() -> Result<String, String> {
         return Ok("Connected to Team Marmalade: 50 shifts in the next five weeks, 2 active incidents, you are OP".into());
     }
     let client = Client::from_settings().ok_or("No API key saved")?;
-    let data = client.fetch(Local::now().naive_local())?;
+    let data = client.fetch(Local::now())?;
     let you = data.shifts.iter().find(|s| s.user_id == data.me).map(|s| s.who.clone());
     Ok(format!("Connected to {}: {} shifts in the next five weeks, {} active incidents{}",
         data.team, data.shifts.len(), data.incidents.len(),
@@ -56,7 +58,7 @@ fn test() -> Result<String, String> {
 pub struct Client {
     token: String,
     pub team_id: String,
-    agent: ureq::Agent,
+    agent: crate::net::Http,
 }
 
 impl Client {
@@ -64,8 +66,7 @@ impl Client {
     pub fn from_settings() -> Option<Self> {
         let token = INTEGRATION.value("api_key")?;
         let team_id = INTEGRATION.value("team_id").unwrap_or_default();
-        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(20)).user_agent("notch-assistant").build();
-        Some(Client { token, team_id, agent })
+        Some(Client { token, team_id, agent: crate::net::Http::new("api.firehydrant.io") })
     }
 
     fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Value, String> {
@@ -82,7 +83,7 @@ impl Client {
     }
 
     /// Raw JSON of every call, for `--probe-raw`.
-    pub fn raw(&self, now: NaiveDateTime) -> Result<Vec<(String, Value)>, String> {
+    pub fn raw(&self, now: Time) -> Result<Vec<(String, Value)>, String> {
         self.check_team()?;
         let (start, end) = window(now);
         Ok(vec![
@@ -96,7 +97,7 @@ impl Client {
         if self.team_id.is_empty() { Err("no team ID: add it in Settings (or set FIREHYDRANT_TEAM_ID)".into()) } else { Ok(()) }
     }
 
-    pub fn fetch(&self, now: NaiveDateTime) -> Result<Data, String> {
+    pub fn fetch(&self, now: Time) -> Result<Data, String> {
         self.check_team()?;
         let token_user = self.get("/v1/current_user", &[])?;
         let token_user = str_at(&token_user, "id").unwrap_or_default().to_string();
@@ -131,17 +132,8 @@ impl Client {
             }
         }
 
-        let incidents = self.get("/v1/incidents", &[("teams", &self.team_id), ("per_page", "50")])?;
-        let incidents = list(&incidents).iter()
-            .filter(|i| i.get("active").and_then(Value::as_bool).unwrap_or(false))
-            .map(|i| Incident {
-                severity: str_at(i, "severity").unwrap_or_default().to_string(),
-                title: str_at(i, "name").unwrap_or("Untitled incident").to_string(),
-                status: capitalise(str_at(i, "current_milestone").unwrap_or_default()),
-                commander: commander(i),
-                started: time_at(i, "started_at").or_else(|| time_at(i, "created_at")).unwrap_or(now),
-            })
-            .collect();
+        let incidents = pages(|page| self.get("/v1/incidents", &[("teams", &self.team_id), ("per_page", "50"), ("page", &page.to_string())]))?;
+        let incidents = active_incidents(&incidents, now);
 
         let me = me.unwrap_or(token_user);
         Ok(Data { team, me, shifts, incidents, origin: Origin::Live { at: now } })
@@ -160,10 +152,9 @@ fn account_name() -> Option<String> {
 }
 
 /// From this week's Monday to five weeks on, as RFC 3339 with the local offset.
-fn window(now: NaiveDateTime) -> (String, String) {
-    let monday = monday_of(now.date()).and_hms_opt(0, 0, 0).unwrap();
-    let local = |t: NaiveDateTime| t.and_local_timezone(Local).earliest().map(|t| t.to_rfc3339()).unwrap_or_default();
-    (local(monday), local(monday + chrono::Duration::weeks(5)))
+fn window(now: Time) -> (String, String) {
+    let monday = monday_of(now.date_naive());
+    (time::midnight(monday).to_rfc3339(), time::midnight(monday + chrono::Duration::weeks(5)).to_rfc3339())
 }
 
 /// A paginated response's `data`, or a bare array.
@@ -171,10 +162,40 @@ fn list(v: &Value) -> Vec<Value> {
     v.get("data").unwrap_or(v).as_array().cloned().unwrap_or_default()
 }
 
+const MAX_PAGES: u64 = 5;
+
+/// Every item of a paginated list, following `pagination.next` for up to `MAX_PAGES` pages;
+/// `get(n)` fetches page `n`, from 1. A response without `pagination` is the only page.
+fn pages(mut get: impl FnMut(u64) -> Result<Value, String>) -> Result<Vec<Value>, String> {
+    let (mut items, mut seen, mut page) = (Vec::new(), HashSet::new(), 1);
+    loop {
+        let v = get(page)?;
+        // An item created while paging pushes the rest down a slot, so the next page repeats one.
+        items.extend(list(&v).into_iter().filter(|i| str_at(i, "id").is_none_or(|id| seen.insert(id.to_string()))));
+        match v.get("pagination").and_then(|p| p.get("next")).and_then(Value::as_u64) {
+            Some(next) if next > page && page < MAX_PAGES => page = next,
+            _ => return Ok(items),
+        }
+    }
+}
+
+fn active_incidents(items: &[Value], now: Time) -> Vec<Incident> {
+    items.iter()
+        .filter(|i| i.get("active").and_then(Value::as_bool).unwrap_or(false))
+        .map(|i| Incident {
+            severity: str_at(i, "severity").unwrap_or_default().to_string(),
+            title: str_at(i, "name").unwrap_or("Untitled incident").to_string(),
+            status: capitalise(str_at(i, "current_milestone").unwrap_or_default()),
+            commander: commander(i),
+            started: time_at(i, "started_at").or_else(|| time_at(i, "created_at")).unwrap_or(now),
+        })
+        .collect()
+}
+
 fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> { v.get(key).and_then(Value::as_str) }
 
-fn time_at(v: &Value, key: &str) -> Option<NaiveDateTime> {
-    DateTime::parse_from_rfc3339(str_at(v, key)?).ok().map(|t| t.with_timezone(&Local).naive_local())
+fn time_at(v: &Value, key: &str) -> Option<Time> {
+    DateTime::parse_from_rfc3339(str_at(v, key)?).ok().map(|t| t.with_timezone(&Local))
 }
 
 fn capitalise(s: &str) -> String {
@@ -191,21 +212,51 @@ fn commander(incident: &Value) -> Option<(String, String)> {
         .map(|u| (initials(str_at(u, "name").unwrap_or("?")), str_at(u, "id").unwrap_or_default().to_string()))
 }
 
-/// Refreshes every five minutes on its own thread, sending each result and waking the UI.
-/// Dropping the returned sender stops it at once (that's how new settings take over); sending
-/// on it refreshes now.
-pub fn spawn(client: Client, tx: std::sync::mpsc::Sender<Result<Data, String>>, wake: rune::Waker) -> std::sync::mpsc::Sender<()> {
-    use std::sync::mpsc::RecvTimeoutError;
-    let (control, commands) = std::sync::mpsc::channel::<()>();
-    std::thread::Builder::new().name("firehydrant".into()).spawn(move || loop {
-        let result = client.fetch(Local::now().naive_local());
-        if let Err(e) = &result { eprintln!("firehydrant: {e}"); }
-        if tx.send(result).is_err() { return; }
-        wake();
-        match commands.recv_timeout(Duration::from_secs(300)) {
-            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
-        }
-    }).expect("spawn firehydrant thread");
-    control
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn page(n: u64, next: Option<u64>) -> Value {
+        json!({ "data": [{ "id": format!("i{n}"), "active": n == 3 }], "pagination": { "page": n, "pages": 3, "next": next, "count": 3, "items": 1 } })
+    }
+    fn ids(items: &[Value]) -> Vec<&str> { items.iter().filter_map(|i| str_at(i, "id")).collect() }
+
+    #[test]
+    fn pages_follow_next_until_there_is_none() {
+        let mut asked = vec![];
+        let items = pages(|n| { asked.push(n); Ok(page(n, (n < 3).then_some(n + 1))) }).unwrap();
+        assert_eq!(asked, [1, 2, 3]);
+        assert_eq!(ids(&items), ["i1", "i2", "i3"]);
+        let active = active_incidents(&items, Time::default());
+        assert_eq!(active.len(), 1, "the active incident on the last page is kept");
+    }
+
+    #[test]
+    fn a_response_without_pagination_is_the_only_page() {
+        let mut asked = 0;
+        let items = pages(|_| { asked += 1; Ok(json!({ "data": [{ "id": "a" }, { "id": "b" }] })) }).unwrap();
+        assert_eq!((asked, ids(&items)), (1, vec!["a", "b"]));
+    }
+
+    #[test]
+    fn pages_stop_at_the_cap_or_a_next_that_does_not_move_on() {
+        let mut asked = vec![];
+        let items = pages(|n| { asked.push(n); Ok(page(n, Some(n + 1))) }).unwrap();
+        assert_eq!(asked, [1, 2, 3, 4, 5]);
+        assert_eq!(items.len(), 5, "what was fetched before the cap is kept");
+
+        let mut asked = vec![];
+        pages(|n| { asked.push(n); Ok(page(n, Some(1))) }).unwrap();
+        assert_eq!(asked, [1]);
+    }
+
+    #[test]
+    fn a_repeated_item_is_kept_once_and_a_failed_page_fails_the_list() {
+        let items = pages(|n| Ok(json!({ "data": [{ "id": "a" }, { "id": if n == 1 { "b" } else { "c" } }], "pagination": { "next": (n == 1).then_some(2) } }))).unwrap();
+        assert_eq!(ids(&items), ["a", "b", "c"]);
+
+        let failed = pages(|n| if n == 1 { Ok(page(1, Some(2))) } else { Err("HTTP 500".into()) });
+        assert_eq!(failed, Err("HTTP 500".to_string()));
+    }
 }

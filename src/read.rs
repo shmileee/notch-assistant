@@ -9,7 +9,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Duration, Local, NaiveDateTime};
+use chrono::{DateTime, Duration, Local};
+use crate::time::Time;
 use serde_json::{Map, Value, json};
 
 use crate::store;
@@ -17,15 +18,15 @@ use crate::store;
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReadState {
     file: &'static str,
-    since: NaiveDateTime,
-    read: HashMap<String, NaiveDateTime>,
+    since: Time,
+    read: HashMap<String, Time>,
     /// The mock's state lives in memory and never touches a file.
     saved: bool,
 }
 
 impl ReadState {
     /// What's saved in `<file>.json`; without it, counting starts at `since`.
-    pub fn load(file: &'static str, since: NaiveDateTime) -> Self {
+    pub fn load(file: &'static str, since: Time) -> Self {
         let saved = store::state(file).unwrap_or(Value::Null);
         let since = saved.get("since").and_then(Value::as_str).and_then(parse).unwrap_or(since);
         let read = saved.get("read").and_then(Value::as_object).into_iter().flatten()
@@ -34,7 +35,7 @@ impl ReadState {
     }
 
     /// For the mock: counting from `since`, in memory only.
-    pub fn memory(since: NaiveDateTime) -> Self { ReadState { file: "", since, read: HashMap::new(), saved: false } }
+    pub fn memory(since: Time) -> Self { ReadState { file: "", since, read: HashMap::new(), saved: false } }
 
     pub fn save(&self) {
         if !self.saved { return; }
@@ -46,14 +47,14 @@ impl ReadState {
 
     /// When you last read `id`: the later of the saved time and `elsewhere` (the service's own
     /// read time), else when counting started.
-    pub fn last_read(&self, id: &str, elsewhere: Option<NaiveDateTime>) -> NaiveDateTime {
+    pub fn last_read(&self, id: &str, elsewhere: Option<Time>) -> Time {
         self.read.get(id).copied().max(elsewhere).unwrap_or(self.since)
     }
 
     /// Keeps the read times a service reports, so something read there stays read once the
     /// service stops reporting it. Forgets ids no longer listed once their time is three months
     /// old: one fetch that misses something mustn't make it unread.
-    pub fn sync<'a>(&mut self, listed: impl IntoIterator<Item = (&'a str, Option<NaiveDateTime>)>, now: NaiveDateTime) {
+    pub fn sync<'a>(&mut self, listed: impl IntoIterator<Item = (&'a str, Option<Time>)>, now: Time) {
         let before = self.read.clone();
         let mut ids = HashSet::new();
         for (id, at) in listed {
@@ -64,31 +65,29 @@ impl ReadState {
         if self.read != before { self.save(); }
     }
 
-    pub fn mark(&mut self, id: &str, at: NaiveDateTime) {
+    pub fn mark(&mut self, id: &str, at: Time) {
         self.bump(id, at);
         self.save();
     }
 
     /// Marks each id read up to its time: the latest event shown, since something that
     /// happened after the last refresh hasn't been seen yet.
-    pub fn mark_all<'a>(&mut self, shown: impl IntoIterator<Item = (&'a str, NaiveDateTime)>) {
+    pub fn mark_all<'a>(&mut self, shown: impl IntoIterator<Item = (&'a str, Time)>) {
         for (id, at) in shown { self.bump(id, at); }
         self.save();
     }
 
-    fn bump(&mut self, id: &str, at: NaiveDateTime) {
+    fn bump(&mut self, id: &str, at: Time) {
         let t = self.read.entry(id.to_string()).or_insert(at);
         *t = (*t).max(at);
     }
 }
 
-pub fn parse(s: &str) -> Option<NaiveDateTime> {
-    DateTime::parse_from_rfc3339(s).ok().map(|t| t.with_timezone(&Local).naive_local())
+pub fn parse(s: &str) -> Option<Time> {
+    DateTime::parse_from_rfc3339(s).ok().map(|t| t.with_timezone(&Local))
 }
 
-fn format(t: NaiveDateTime) -> String {
-    t.and_local_timezone(Local).earliest().map(|t| t.to_rfc3339()).unwrap_or_default()
-}
+fn format(t: Time) -> String { t.to_rfc3339() }
 
 /// The unread events already announced, so a peek shows only what's new.
 #[derive(Debug, Default)]
@@ -109,9 +108,7 @@ impl Announced {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
-
-    fn at(h: u32, m: u32) -> NaiveDateTime { NaiveDate::from_ymd_opt(2026, 11, 10).unwrap().and_hms_opt(h, m, 0).unwrap() }
+    fn at(h: u32, m: u32) -> Time { crate::time::at(2026, 11, 10, h, m) }
 
     #[test]
     fn the_latest_read_wins_and_since_is_the_fallback() {

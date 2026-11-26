@@ -43,7 +43,8 @@ The open panel has a sidebar of integrations, each with its count; pick one and 
   beside it for each integration with something unread (purple: GitHub, indigo: Linear), a countdown to a
   meeting that starts soon, and the current primary's avatar on the right. When something new arrives or a
   meeting is about to start, the island drops a line under the notch for six seconds saying what; hovering
-  it opens that integration.
+  it opens that integration. Several in a row take turns, meetings first, and they wait while an app is
+  full screen on that display, so a slideshow or a full-screen call stays clean.
 
 In GitHub and Linear, a click opens the item where the unread part starts and marks it read. Until an
 integration is connected, it shows mock data, labelled "Mock data · Connect" in the panel.
@@ -70,6 +71,8 @@ a GitHub token and a Linear API key (see [GitHub and Linear](#github-and-linear)
 (see [Calendar](#calendar)).
 
 - **Quitting:** the × in the open panel, or ⌘Q while Settings is in front.
+- **Screen sharing:** the panel is left out of screen sharing, recordings and screenshots, so a shared
+  screen doesn't show what it peeks at. The **Show in screen sharing** switch in Settings puts it back.
 - **Open at login:** a switch at the bottom left of Settings, also in System Settings › General › Login
   Items, or `"<app>/Contents/MacOS/notch-assistant" --login on|off|status`.
 - **Upgrading and uninstalling:** the app restarts itself when a new version replaces it and quits when it's
@@ -91,13 +94,14 @@ Saving reconnects and tests the connection; the panel then refreshes every five 
 forces the mock.
 
 An API key acts as a bot user, so "you" on the schedule is found by name: `FIREHYDRANT_ME` (a full name or
-FireHydrant user ID), else this Mac account's full name. It makes three read-only calls:
+FireHydrant user ID), else this Mac account's full name. It makes three kinds of read-only call:
 
 - `GET /v1/current_user`: the token's user, the fallback for "you".
 - `GET /v1/teams/{team}/on_call_schedules`: the team's shifts from this Monday to five weeks out. A
-  schedule whose name contains "secondary" is the secondary rotation. Back-to-back daily shifts for the same
-  person and role count as one rotation.
-- `GET /v1/incidents?teams={team}`: the team's active incidents.
+  schedule whose name contains "secondary" is the secondary rotation. Shifts of the same person and role
+  up to four days apart, with nobody else's shift in between, count as one rotation, so a weekend doesn't
+  split it.
+- `GET /v1/incidents?teams={team}`: the team's active incidents, up to five pages of them.
 
 To check what it reads without launching the app: `cargo run --release -- --probe` (`--probe-raw` dumps
 the JSON).
@@ -120,7 +124,7 @@ access in Settings › Calendar. What it shows and what to do when macOS asks ag
 ## Development
 
 ```sh
-cargo run --release                                        # run it (stop the installed copy first)
+cargo run --release                                        # run it (quit the installed copy first; a second copy quits)
 cargo test
 cargo run -- --scene open --snap snaps/open.png           # scenes: collapsed, open, incidents, offhours, pulls, reviews, linear, calendar, peek, soon
 cargo run -- --scene collapsed --script scripts/hover.json --snap mid.png --at 0.75
@@ -149,7 +153,8 @@ proposes the cask update. `make icon` redraws `assets/AppIcon.icns`.
 | File | Role |
 | --- | --- |
 | `src/main.rs` | App setup: a transparent overlay at the top of the display under the pointer, where only the island takes clicks. Also the timers, the minute refresh and the snapshot scenes. |
-| `src/notch.rs` | The notch of the current display (`NSScreen.safeAreaInsets`), or a virtual 185-pt one as tall as the menu bar. |
+| `src/notch.rs` | The notch of the current display (`NSScreen.safeAreaInsets`), or a virtual 185-pt one as tall as the menu bar. Also whether another app is full screen there. |
+| `src/anchor.rs` | Keeps the panel at the top of its display: out of the Accessibility window list, so window managers such as Rectangle can't grab it, and put back on the next poll if anything moves it. |
 | `src/island.rs` | The hover state machine: `Collapsed → Arming (120 ms) → Open → Closing (400 ms)`, so a passing pointer doesn't open it. |
 | `src/view.rs` | The island, and the open panel's sidebar and sections. Beside a real notch, the top bar keeps clear of it. |
 | `src/oncall.rs` | The `OnCallSource` trait, the mock, and the `Snapshot` the view renders. |
@@ -160,10 +165,13 @@ proposes the cask update. `make icon` redraws `assets/AppIcon.icns`.
 | `src/linear.rs` | The Linear client and its integration declaration. |
 | `src/agenda.rs` | Meetings, what the Calendar section picks from them at a given moment, join links, and the mock. |
 | `src/calendar.rs` | The EventKit client, the calendar permission and its integration declaration. |
-| `src/feed.rs` | A notifying integration's data, read state and refresh thread. |
+| `src/feed.rs` | A notifying integration's data, read state and refresh thread, which retries sooner after a failure. |
+| `src/net.rs` | The HTTP agent: the Keychain's root certificates as well as ureq's, and the system's HTTPS proxy. |
+| `src/wake.rs` | Refreshes everything when the Mac wakes from sleep. |
+| `src/time.rs` | Times as instants shown in local time, so clock changes and time-zone travel don't shift them. |
 | `src/read.rs` | What you've read of each, and which unread events are new since the last refresh. |
 | `src/integrations.rs` | The integration registry: each one's fields (`Secret`, `Text` or a macOS `Permission`), env overrides and connection test. |
-| `src/store.rs` | Secrets in the Keychain (written via `security -i`, never on a command line), the rest in settings.json. |
+| `src/store.rs` | Secrets in the Keychain (written via `security -i`, never on a command line), the rest in settings.json, written whole or not at all. Also the lock that keeps a second copy from running. |
 | `src/settings.rs` | The Settings window, built from the registry. |
 | `src/login.rs` | Open at login (`SMAppService`); only the app bundle can register. |
 | `src/installed.rs` | Restarts the app when its installed copy is replaced and quits it when removed. |

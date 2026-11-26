@@ -12,7 +12,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use chrono::{Local, NaiveDateTime};
+use chrono::{Local};
+use crate::time::Time;
 use serde_json::{Value, json};
 
 use crate::feed::Fetched;
@@ -45,7 +46,7 @@ fn test() -> Result<String, String> {
         return Ok("Connected as OP: 3 open issues assigned to you, 2 with something unread".into());
     }
     let client = Client::from_settings().ok_or("No API key saved")?;
-    let now = Local::now().naive_local();
+    let now = Local::now();
     let issues = client.fetch(now)?;
     let open = issues.list.iter().filter(|t| t.assigned).count();
     let unread = unread_count(&issues.list, &ReadState::load(issues::READ_FILE, now - issues::look_back()));
@@ -54,15 +55,14 @@ fn test() -> Result<String, String> {
 
 pub struct Client {
     key: String,
-    agent: ureq::Agent,
+    agent: crate::net::Http,
 }
 
 impl Client {
     /// A client from the saved settings; `None` without an API key.
     pub fn from_settings() -> Option<Self> {
         let key = INTEGRATION.value("api_key")?;
-        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(20)).user_agent("notch-assistant").build();
-        Some(Client { key, agent })
+        Some(Client { key, agent: crate::net::Http::new("api.linear.app") })
     }
 
     /// The query's raw JSON, for `--probe-linear`'s troubleshooting.
@@ -88,12 +88,12 @@ impl Client {
         }
     }
 
-    pub fn fetch(&self, now: NaiveDateTime) -> Result<Issues, String> {
+    pub fn fetch(&self, now: Time) -> Result<Issues, String> {
         Ok(parse_issues(&self.query()?["data"], now))
     }
 
     pub fn fetcher(self) -> impl FnMut() -> Result<Issues, String> + Send + 'static {
-        move || self.fetch(Local::now().naive_local())
+        move || self.fetch(Local::now())
     }
 }
 
@@ -103,7 +103,7 @@ fn first_error(body: &Value) -> Option<String> {
     body.get("errors")?.as_array()?.iter().find_map(|e| e.get("message")?.as_str().map(str::to_string))
 }
 
-fn parse_issues(data: &Value, now: NaiveDateTime) -> Issues {
+fn parse_issues(data: &Value, now: Time) -> Issues {
     let me = str_at(&data["viewer"], "name").unwrap_or_default().to_string();
     let mut list: Vec<Ticket> = vec![];
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -143,7 +143,7 @@ fn ticket(v: &Value, project: bool) -> Option<Ticket> {
 }
 
 /// A notification as the panel shows it; `None` for a bot's.
-fn notice(n: &Value, now: NaiveDateTime) -> Option<Notice> {
+fn notice(n: &Value, now: Time) -> Option<Notice> {
     let who = str_at(&n["actor"], "name").unwrap_or_default().to_string();
     if who.is_empty() && !n["botActor"].is_null() { return None; }
     let snoozed = str_at(n, "snoozedUntilAt").and_then(parse).is_some_and(|t| t > now);
@@ -242,9 +242,7 @@ fragment issue on Issue { id identifier title url updatedAt state { name type co
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
-
-    fn now() -> NaiveDateTime { NaiveDate::from_ymd_opt(2026, 11, 10).unwrap().and_hms_opt(14, 5, 0).unwrap() }
+    fn now() -> Time { crate::time::at(2026, 11, 10, 14, 5) }
 
     #[test]
     fn headlines_read_naturally_and_unknown_types_still_make_sense() {

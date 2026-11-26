@@ -13,7 +13,7 @@
 
 use std::sync::OnceLock;
 
-use chrono::{NaiveDate, NaiveDateTime};
+use crate::time::Time;
 use rune::tok::TextStyle;
 use rune::{Color, Cx, El, col, el, text};
 
@@ -30,7 +30,7 @@ static DEMO: OnceLock<bool> = OnceLock::new();
 pub fn on() -> bool { *DEMO.get_or_init(|| std::env::var_os("NOTCH_DEMO").is_some()) }
 
 /// The pinned demo time: the user (OP) is primary this week.
-pub fn time() -> NaiveDateTime { NaiveDate::from_ymd_opt(2026, 11, 10).unwrap().and_hms_opt(14, 5, 0).unwrap() }
+pub fn time() -> Time { crate::time::at(2026, 11, 10, 14, 5) }
 
 /// The backdrop overlay's (empty) state.
 pub struct Backdrop;

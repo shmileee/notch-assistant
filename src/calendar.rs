@@ -10,19 +10,23 @@
 //! settings.json remembers it, so that losing access later shows as an error rather than as
 //! the mock.
 
+use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
 use std::time::Duration;
 
 use block2::RcBlock;
-use chrono::{DateTime, Local, NaiveDateTime, NaiveTime, Utc};
+use chrono::{DateTime, Local, Utc};
+use crate::time::{self, Time};
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{Bool, NSObjectProtocol};
 use objc2::{msg_send_id, sel};
 use objc2_app_kit::{NSColor, NSColorSpace, NSWorkspace};
-use objc2_event_kit::{EKAuthorizationStatus, EKEntityType, EKEvent, EKEventStatus, EKEventStore, EKParticipantStatus};
-use objc2_foundation::{NSDate, NSError, NSString, NSURL};
+use objc2_event_kit::{EKAuthorizationStatus, EKEntityType, EKEvent, EKEventAvailability, EKEventStatus, EKEventStore,
+    EKEventStoreChangedNotification, EKParticipantStatus};
+use objc2_foundation::{NSDate, NSError, NSNotification, NSNotificationCenter, NSString, NSURL};
 
 use crate::agenda::{self, Agenda, Event, Focus, Reply};
 use crate::feed::Fetched;
@@ -53,13 +57,23 @@ const PRIVACY_PANE: &str = "x-apple.systempreferences:com.apple.preference.secur
 /// Set when the panel's own request is answered, for it to reconnect.
 static ANSWERED: AtomicBool = AtomicBool::new(false);
 static ASKED_AGAIN: Once = Once::new();
+static REMEMBERED: AtomicBool = AtomicBool::new(false);
+static SEEN: Mutex<Option<Access>> = Mutex::new(None);
+static CHANGED: AtomicBool = AtomicBool::new(false);
+static WATCHING: Once = Once::new();
+
+thread_local! {
+    /// The store of the thread that fetches, kept while access lasts: EventKit is slow to set
+    /// one up, and only a store that's alive posts `EKEventStoreChangedNotification`.
+    static STORE: RefCell<Option<Retained<EKEventStore>>> = const { RefCell::new(None) };
+}
 
 fn status() -> Access {
     if crate::sandboxed() {
         return if enabled() { Access::Granted } else { Access::NotAsked };
     }
     match unsafe { EKEventStore::authorizationStatusForEntityType(EKEntityType::Event) } {
-        EKAuthorizationStatus::FullAccess => Access::Granted,
+        EKAuthorizationStatus::FullAccess => { remember(); Access::Granted }
         EKAuthorizationStatus::NotDetermined if crate::login::bundled() => Access::NotAsked,
         EKAuthorizationStatus::NotDetermined => Access::Unavailable,
         EKAuthorizationStatus::Restricted => Access::Restricted,
@@ -70,6 +84,38 @@ fn status() -> Access {
 
 /// Whether access was granted once, whatever macOS says now.
 pub fn enabled() -> bool { store::setting(ID, "enabled").is_some() }
+
+/// Remembers the grant once per launch, also when it was given in System Settings rather than
+/// in the app's prompt. Only the app bundle does: the flag makes the installed app ask at
+/// launch, which `cargo run` from a terminal with access mustn't cause.
+fn remember() {
+    if REMEMBERED.swap(true, Ordering::SeqCst) || !crate::login::bundled() || enabled() { return; }
+    if let Err(e) = store::set_setting(ID, "enabled", "yes") { eprintln!("calendar: {e}"); }
+}
+
+/// Whether calendar access changed since the last call, as when it's turned on in System
+/// Settings, which tells the app nothing. Cheap enough for every poll.
+pub fn access_changed() -> bool {
+    if crate::sandboxed() { return false; }
+    changed(&mut SEEN.lock().unwrap(), status())
+}
+
+/// Keeps `now` as `seen` and says whether it differs; the first look isn't a change.
+fn changed(seen: &mut Option<Access>, now: Access) -> bool { seen.replace(now).is_some_and(|before| before != now) }
+
+/// Starts noting changes to the Calendar database, by any app or account, for `take_changed`.
+/// Call it once, on the main thread.
+pub fn watch_changes() {
+    WATCHING.call_once(|| unsafe {
+        let noted = RcBlock::new(|_: NonNull<NSNotification>| CHANGED.store(true, Ordering::SeqCst));
+        // The center keeps the observer until it's removed, and it never is.
+        let _ = NSNotificationCenter::defaultCenter()
+            .addObserverForName_object_queue_usingBlock(Some(EKEventStoreChangedNotification), None, None, &noted);
+    });
+}
+
+/// Whether the Calendar database changed since the last call.
+pub fn take_changed() -> bool { CHANGED.swap(false, Ordering::SeqCst) }
 
 fn request(done: Box<dyn FnOnce() + Send>) {
     let answered = move |granted: bool| {
@@ -123,8 +169,7 @@ fn open(url: &str) {
 /// find the meeting Calendar still opens.
 pub fn show(e: &Event) {
     if e.id.is_empty() { return; }
-    let Some(start) = e.start.and_local_timezone(Local).earliest() else { return };
-    open(&format!("ical://ekevent/{}/{}?method=show&options=more", start.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ"), e.id));
+    open(&format!("ical://ekevent/{}/{}?method=show&options=more", e.start.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ"), e.id));
 }
 
 fn test() -> Result<String, String> {
@@ -132,11 +177,11 @@ fn test() -> Result<String, String> {
         std::thread::sleep(Duration::from_millis(1200));
         return Ok("Reading 3 calendars: 4 meetings left today, next 1:1 with ZQ at 15:00".into());
     }
-    let now = Local::now().naive_local();
+    let now = Local::now();
     let found = fetch(now)?;
     let day = agenda::day(&found.events, now);
     let left = day.later.len() + day.focus.iter().count();
-    let next = day.later.iter().copied().chain(day.focus.map(Focus::event)).filter(|e| e.start > now).min_by_key(|e| e.start);
+    let next = day.later.iter().copied().chain(day.focus.map(Focus::event)).filter(|e| e.start > now && e.busy()).min_by_key(|e| e.start);
     let next = next.map(|e| format!(", next {} at {}", e.title, e.start.format("%H:%M"))).unwrap_or_default();
     Ok(format!("Reading {} calendars: {left} meetings left today{next}", found.calendars))
 }
@@ -144,30 +189,43 @@ fn test() -> Result<String, String> {
 impl Fetched for Agenda { fn origin(&mut self) -> &mut Origin { &mut self.origin } }
 
 pub fn fetcher() -> impl FnMut() -> Result<Agenda, String> + Send + 'static {
-    || fetch(Local::now().naive_local())
+    || fetch(Local::now())
 }
 
 /// Today's and tomorrow's meetings from every calendar. Never asks for access, and never reads
 /// in demo mode or headless, where access is only pretended.
-pub fn fetch(now: NaiveDateTime) -> Result<Agenda, String> {
+pub fn fetch(now: Time) -> Result<Agenda, String> {
     if crate::sandboxed() { return Err("Calendar isn't read in demo mode".into()); }
-    match status() {
+    let access = status();
+    if access != Access::Granted { STORE.set(None); }
+    match access {
         Access::Granted => {}
         Access::Restricted => return Err("Calendar access is blocked by whoever manages this Mac".into()),
         Access::Unavailable => return Err("Calendar access needs the installed app, or a terminal that has access to Calendars".into()),
         Access::NotAsked | Access::Denied => return Err("Calendar access is off: allow it in Settings › Calendar".into()),
     }
-    let from = now.date().and_time(NaiveTime::MIN);
-    let to = from + chrono::Duration::days(2);
+    let today = now.date_naive();
+    let (from, to) = (time::midnight(today), time::midnight(today + chrono::Duration::days(2)));
     // A surprise from EventKit must show as an error, not end the thread that refreshes.
-    catch_unwind(AssertUnwindSafe(|| autoreleasepool(|_| unsafe {
-        let store = EKEventStore::new();
+    catch_unwind(AssertUnwindSafe(|| autoreleasepool(|_| STORE.with_borrow_mut(|store| unsafe {
+        let store = store.get_or_insert_with(|| EKEventStore::new());
         let calendars = store.calendarsForEntityType(EKEntityType::Event).len();
         let predicate = store.predicateForEventsWithStartDate_endDate_calendars(&date(from), &date(to), None);
-        let mut events: Vec<Event> = store.eventsMatchingPredicate(&predicate).to_vec().into_iter().filter_map(event).collect();
+        let mut events = one_by_one(store.eventsMatchingPredicate(&predicate).to_vec(), event);
         events.sort_by_key(|e| (e.start, e.end));
         Agenda { calendars, events, origin: Origin::Live { at: now } }
-    }))).map_err(|_| "Reading the calendars failed".to_string())
+    })))).map_err(|_| {
+        STORE.set(None);
+        "Reading the calendars failed".to_string()
+    })
+}
+
+/// Converts each item on its own, so one that panics is skipped instead of failing the batch.
+fn one_by_one<T, U>(items: impl IntoIterator<Item = T>, convert: impl Fn(T) -> Option<U>) -> Vec<U> {
+    items.into_iter().filter_map(|item| catch_unwind(AssertUnwindSafe(|| convert(item))).unwrap_or_else(|_| {
+        eprintln!("calendar: skipped an event that couldn't be read");
+        None
+    })).collect()
 }
 
 /// An event as the panel keeps it; `None` for one that was cancelled, that you declined, or
@@ -175,8 +233,11 @@ pub fn fetch(now: NaiveDateTime) -> Result<Agenda, String> {
 fn event(e: &EKEvent) -> Option<Event> {
     unsafe {
         if e.status() == EKEventStatus::Canceled { return None; }
-        let mine = e.attendees().and_then(|all| all.to_vec().into_iter().find(|p| p.isCurrentUser()).map(|p| p.participantStatus()));
-        let reply = reply(mine)?;
+        let list = e.attendees();
+        let attendees = list.as_deref().map(|a| a.to_vec()).unwrap_or_default();
+        let me = attendees.iter().find(|p| p.isCurrentUser());
+        let reply = reply(me.map(|p| p.participantStatus()))?;
+        let mine = mine(!attendees.is_empty(), me.is_some(), e.organizer().is_some_and(|o| o.isCurrentUser()));
         // The headers allow nil for these, which the bindings' plain getters would panic on.
         let title: Option<Retained<NSString>> = msg_send_id![e, title];
         let start: Option<Retained<NSDate>> = msg_send_id![e, startDate];
@@ -198,6 +259,8 @@ fn event(e: &EKEvent) -> Option<Event> {
             join: agenda::join_link([link.as_str(), location.as_str(), notes.as_str()]),
             location,
             reply,
+            free: e.availability() == EKEventAvailability::Free,
+            mine,
         })
     }
 }
@@ -212,6 +275,9 @@ fn reply(status: Option<EKParticipantStatus>) -> Option<Reply> {
     }
 }
 
+/// Whether a meeting is yours rather than a colleague's on a shared calendar.
+fn mine(has_guests: bool, guest: bool, organizer: bool) -> bool { !has_guests || guest || organizer }
+
 const GREY: u32 = 0x8e8e93;
 
 fn rgb(color: &NSColor) -> u32 {
@@ -220,14 +286,13 @@ fn rgb(color: &NSColor) -> u32 {
     unsafe { channel(c.redComponent()) << 16 | channel(c.greenComponent()) << 8 | channel(c.blueComponent()) }
 }
 
-fn local(d: &NSDate) -> NaiveDateTime {
+fn local(d: &NSDate) -> Time {
     let secs = unsafe { d.timeIntervalSince1970() };
-    DateTime::from_timestamp(secs.floor() as i64, 0).map(|t| t.with_timezone(&Local).naive_local()).unwrap_or_default()
+    DateTime::from_timestamp(secs.floor() as i64, 0).map(|t| t.with_timezone(&Local)).unwrap_or_default()
 }
 
-fn date(t: NaiveDateTime) -> Retained<NSDate> {
-    let secs = t.and_local_timezone(Local).earliest().map_or(0, |t| t.timestamp());
-    unsafe { NSDate::dateWithTimeIntervalSince1970(secs as f64) }
+fn date(t: Time) -> Retained<NSDate> {
+    unsafe { NSDate::dateWithTimeIntervalSince1970(t.timestamp() as f64) }
 }
 
 #[cfg(test)]
@@ -244,8 +309,32 @@ mod tests {
     }
 
     #[test]
+    fn a_meeting_with_guests_is_yours_only_as_a_guest_or_the_organizer() {
+        assert!(mine(false, false, false), "an event of your own, with no guests");
+        assert!(mine(true, true, false));
+        assert!(mine(true, false, true), "the organizer isn't always among the guests");
+        assert!(!mine(true, false, false), "a colleague's meeting on a shared calendar");
+    }
+
+    #[test]
+    fn an_event_that_panics_is_skipped_and_the_rest_are_kept() {
+        let kept = one_by_one([1, 2, 3, 4], |n| if n == 3 { panic!("an odd event") } else { (n != 1).then_some(n) });
+        assert_eq!(kept, [2, 4]);
+    }
+
+    #[test]
+    fn access_counts_as_changed_only_after_a_first_look() {
+        let mut seen = None;
+        assert!(!changed(&mut seen, Access::NotAsked), "the first look");
+        assert!(!changed(&mut seen, Access::NotAsked));
+        assert!(changed(&mut seen, Access::Granted), "turned on in System Settings");
+        assert!(!changed(&mut seen, Access::Granted));
+        assert!(changed(&mut seen, Access::Denied));
+    }
+
+    #[test]
     fn dates_survive_the_trip_through_nsdate() {
-        let t = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap().and_hms_opt(14, 5, 0).unwrap();
+        let t = time::at(2026, 11, 10, 14, 5);
         assert_eq!(local(&date(t)), t);
     }
 }

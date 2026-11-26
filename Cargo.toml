@@ -10,12 +10,16 @@ license = "MIT"
 rune = { git = "https://github.com/anomalyco/rune", rev = "70eff81165e9854834a75f17753edb6c96ab2ab7" }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "70eff81165e9854834a75f17753edb6c96ab2ab7" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "2", features = ["json", "proxy-from-env"] }
+# The agent's TLS config: ureq's own roots plus the Keychain's (see src/net.rs).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+webpki-roots = "0.26"
 serde_json = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5.2"
-objc2-foundation = { version = "0.2.2", features = ["NSArray", "NSDate", "NSError", "NSGeometry", "NSString", "NSURL"] }
+objc2-foundation = { version = "0.2.2", features = ["NSArray", "NSDate", "NSError", "NSGeometry", "NSNotification", "NSOperation", "NSString", "NSURL"] }
 objc2-app-kit = { version = "0.2.2", features = ["NSScreen", "NSLayoutConstraint", "NSEvent", "NSColor", "NSColorSpace", "NSWorkspace"] }
 objc2-event-kit = { version = "0.2.2", features = ["EKCalendar", "EKCalendarItem", "EKEvent", "EKEventStore", "EKObject", "EKParticipant", "EKTypes", "block2", "objc2-app-kit"] }
 block2 = "0.5.1"

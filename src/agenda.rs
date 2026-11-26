@@ -4,7 +4,8 @@
 //! EventKit hands over each occurrence of a repeating meeting as its own event, so nothing
 //! here expands repeats. Declined and cancelled meetings never get this far.
 
-use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Duration, NaiveDate};
+use crate::time::{self, Time};
 
 use crate::oncall::Origin;
 
@@ -32,8 +33,8 @@ pub struct Event {
     /// EventKit's calendar item ID; empty in the mock.
     pub id: String,
     pub title: String,
-    pub start: NaiveDateTime,
-    pub end: NaiveDateTime,
+    pub start: Time,
+    pub end: Time,
     pub all_day: bool,
     pub calendar: String,
     /// The calendar's colour, as 0xRRGGBB.
@@ -42,18 +43,27 @@ pub struct Event {
     pub location: String,
     pub join: Option<Join>,
     pub reply: Reply,
+    /// Marked free, so it doesn't hold your time (a focus block, a reminder).
+    pub free: bool,
+    /// False for someone else's meeting on a shared calendar: it has guests, and you're neither
+    /// one of them nor the organizer.
+    pub mine: bool,
 }
 
 impl Event {
-    /// The occurrences of a repeating meeting share an ID, so the start tells them apart.
-    pub fn key(&self) -> String { format!("{}@{}", self.id, self.start.format("%Y%m%dT%H%M")) }
+    /// The occurrences of a repeating meeting share an ID, so the start tells them apart. As an
+    /// instant, so a change of time zone doesn't make a meeting look new.
+    pub fn key(&self) -> String { format!("{}@{}", self.id, self.start.timestamp()) }
 
-    pub fn covers(&self, t: NaiveDateTime) -> bool { self.start <= t && t < self.end }
+    pub fn covers(&self, t: Time) -> bool { self.start <= t && t < self.end }
+
+    /// Whether it takes your time. Only these lead the panel, peek and count down; the rest are
+    /// just listed.
+    pub fn busy(&self) -> bool { self.mine && !self.free }
 
     /// Whether any of it falls on `day`.
     pub fn on(&self, day: NaiveDate) -> bool {
-        let from = day.and_time(NaiveTime::MIN);
-        self.start < from + Duration::days(1) && self.end > from
+        self.start < time::midnight(day + Duration::days(1)) && self.end > time::midnight(day)
     }
 
     /// "14:00–14:30".
@@ -88,7 +98,7 @@ impl Agenda {
     pub fn loading() -> Self { Agenda { calendars: 0, events: vec![], origin: Origin::Loading } }
 }
 
-/// The meeting the panel leads with.
+/// The meeting the panel leads with, of those that take your time.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Focus<'a> {
     /// The one you're in; of several, the one that started last.
@@ -113,25 +123,26 @@ pub struct Day<'a> {
     pub timed: Vec<&'a Event>,
 }
 
-pub fn day(events: &[Event], now: NaiveDateTime) -> Day<'_> {
-    let (today, tomorrow) = (now.date(), now.date() + Duration::days(1));
+pub fn day(events: &[Event], now: Time) -> Day<'_> {
+    let (today, tomorrow) = (now.date_naive(), now.date_naive() + Duration::days(1));
     fn by_start(mut list: Vec<&Event>) -> Vec<&Event> { list.sort_by_key(|e| (e.start, e.end)); list }
     let timed = by_start(events.iter().filter(|e| !e.all_day && e.on(today)).collect());
-    let focus = timed.iter().filter(|e| e.covers(now)).max_by_key(|e| e.start).map(|e| Focus::Now(e))
-        .or_else(|| timed.iter().find(|e| e.start > now).map(|e| Focus::Next(e)));
+    let busy = || timed.iter().filter(|e| e.busy());
+    let focus = busy().filter(|e| e.covers(now)).max_by_key(|e| e.start).map(|e| Focus::Now(e))
+        .or_else(|| busy().find(|e| e.start > now).map(|e| Focus::Next(e)));
     let focused = |e: &Event| focus.is_some_and(|f| std::ptr::eq(f.event(), e));
     Day {
         all_day: events.iter().filter(|e| e.all_day && e.on(today)).collect(),
         focus,
         later: timed.iter().copied().filter(|e| e.end > now && !focused(e)).collect(),
-        tomorrow: by_start(events.iter().filter(|e| !e.all_day && e.start.date() == tomorrow).collect()),
+        tomorrow: by_start(events.iter().filter(|e| !e.all_day && e.start.date_naive() == tomorrow).collect()),
         timed,
     }
 }
 
-/// Meetings that start within `within` from now, soonest first.
-pub fn starting(events: &[Event], now: NaiveDateTime, within: Duration) -> Vec<&Event> {
-    let mut list: Vec<_> = events.iter().filter(|e| !e.all_day && e.start > now && e.start - now <= within).collect();
+/// Meetings that take your time and start within `within` from now, soonest first.
+pub fn starting(events: &[Event], now: Time, within: Duration) -> Vec<&Event> {
+    let mut list: Vec<_> = events.iter().filter(|e| !e.all_day && e.busy() && e.start > now && e.start - now <= within).collect();
     list.sort_by_key(|e| e.start);
     list
 }
@@ -169,8 +180,9 @@ fn links(text: &str) -> Vec<String> {
 }
 
 fn safe_link_target(url: &str) -> Option<String> {
-    let (host, query) = url.strip_prefix("https://")?.split_once('?')?;
-    if !host.split('/').next()?.ends_with("safelinks.protection.outlook.com") { return None; }
+    let (host, rest) = split_url(url)?;
+    if !on(&host, "safelinks.protection.outlook.com") { return None; }
+    let query = rest.split_once('?')?.1.split('#').next()?;
     let encoded = query.split('&').find_map(|pair| pair.strip_prefix("url="))?;
     Some(percent_decode(encoded))
 }
@@ -187,21 +199,33 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// An `https://` link's host, lowercased, and what follows it. `None` unless the host is plain
+/// enough that a browser reads the same one: `https://teams.microsoft.com:x@evil.example`
+/// opens evil.example, and browsers also end the host at a backslash.
+fn split_url(url: &str) -> Option<(String, &str)> {
+    let rest = url.strip_prefix("https://")?;
+    let (authority, rest) = rest.split_at(rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len()));
+    let (host, port) = authority.split_once(':').unwrap_or((authority, ""));
+    let plain = !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'));
+    (plain && port.bytes().all(|b| b.is_ascii_digit())).then(|| (host.to_ascii_lowercase(), rest))
+}
+
+fn on(host: &str, domain: &str) -> bool { host == domain || host.ends_with(&format!(".{domain}")) }
+
 /// The service a link joins a call on. Invitations also link to help pages and meeting
 /// options on the same hosts, so each service's join paths are spelled out.
 fn service(url: &str) -> Option<&'static str> {
-    let rest = url.strip_prefix("https://")?;
-    let split = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let host = rest[..split].split(':').next()?.to_ascii_lowercase();
-    let path = rest[split..].to_ascii_lowercase();
-    let on = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
+    let (host, rest) = split_url(url)?;
+    let path = rest.to_ascii_lowercase();
+    let on = |domain: &str| on(&host, domain);
     let under = |prefixes: &[&str]| prefixes.iter().any(|p| path.starts_with(p));
-    let named = path.len() > 1;
+    let code = path.strip_prefix('/').and_then(|p| p.split(['/', '?', '#']).next()).unwrap_or_default();
+    let named = !code.is_empty();
     if on("teams.microsoft.com") && under(&["/l/meetup-join/", "/meet/"]) || on("teams.live.com") && under(&["/meet/"]) {
         Some("Teams")
     } else if on("zoom.us") && under(&["/j/", "/my/", "/w/", "/s/"]) {
         Some("Zoom")
-    } else if on("meet.google.com") && path[1..].split(['/', '?']).next().is_some_and(|code| code.contains('-')) {
+    } else if on("meet.google.com") && code.contains('-') {
         Some("Google Meet")
     } else if on("webex.com") && (path.contains("/j.php") || under(&["/meet/", "/join/"])) {
         Some("Webex")
@@ -221,11 +245,12 @@ const PERSONAL: u32 = 0x63da38;
 const BIRTHDAYS: u32 = 0xcc73e1;
 
 /// Made-up meetings for the made-up team of the other mocks, at fixed times of `now`'s day.
-pub fn mock(now: NaiveDateTime) -> Agenda {
-    let at = |day: i64, h: u32, m: u32| (now.date() + Duration::days(day)).and_hms_opt(h, m, 0).unwrap();
+pub fn mock(now: Time) -> Agenda {
+    let at = |day: i64, h: u32, m: u32| time::local((now.date_naive() + Duration::days(day)).and_hms_opt(h, m, 0).unwrap());
     let teams = || Some(Join { service: "Teams", url: String::new() });
-    let meeting = |title: &str, (start, end): (NaiveDateTime, NaiveDateTime), calendar: &str, color, location: &str, join, reply| Event {
+    let meeting = |title: &str, (start, end): (Time, Time), calendar: &str, color, location: &str, join, reply| Event {
         id: String::new(), title: title.into(), start, end, all_day: false, calendar: calendar.into(), color, location: location.into(), join, reply,
+        free: false, mine: true,
     };
     let all_day = |title: &str, from: i64, days: i64, calendar: &str, color| Event {
         all_day: true, ..meeting(title, (at(from, 0, 0), at(from + days, 0, 0)), calendar, color, "", None, Reply::Yes)
@@ -250,7 +275,7 @@ pub fn mock(now: NaiveDateTime) -> Agenda {
 mod tests {
     use super::*;
 
-    fn at(d: u32, h: u32, m: u32) -> NaiveDateTime { NaiveDate::from_ymd_opt(2026, 11, d).unwrap().and_hms_opt(h, m, 0).unwrap() }
+    fn at(d: u32, h: u32, m: u32) -> Time { time::at(2026, 11, d, h, m) }
     fn titles(list: &[&Event]) -> Vec<String> { list.iter().map(|e| e.title.clone()).collect() }
 
     #[test]
@@ -281,9 +306,23 @@ mod tests {
     }
 
     #[test]
+    fn free_time_and_colleagues_meetings_are_listed_but_never_lead_peek_or_count_down() {
+        let mut events = mock(at(10, 14, 5)).events;
+        let standup = events[2].clone();
+        events.push(Event { title: "Focus time".into(), start: at(10, 14, 30), end: at(10, 17, 30), free: true, ..standup.clone() });
+        events.push(Event { title: "ZQ's interview".into(), start: at(10, 14, 50), end: at(10, 15, 50), mine: false, ..standup });
+        let d = day(&events, at(10, 14, 40));
+        assert!(matches!(d.focus, Some(Focus::Next(e)) if e.title == "1:1 with ZQ"), "a free block you're in doesn't lead");
+        assert_eq!(titles(&d.later), ["Focus time", "ZQ's interview", "Kafka upgrade planning", "Climbing"]);
+        assert!(starting(&events, at(10, 14, 20), countdown()).is_empty(), "a free block doesn't count down");
+        assert!(starting(&events, at(10, 14, 46), lead()).is_empty(), "a colleague's meeting doesn't peek");
+        assert_eq!(titles(&starting(&events, at(10, 14, 46), countdown())), ["1:1 with ZQ"]);
+    }
+
+    #[test]
     fn a_meeting_across_midnight_is_on_both_days() {
         let e = Event { start: at(10, 23, 0), end: at(11, 1, 0), ..mock(at(10, 9, 0)).events[2].clone() };
-        assert!(e.on(at(10, 0, 0).date()) && e.on(at(11, 0, 0).date()) && !e.on(at(12, 0, 0).date()));
+        assert!(e.on(at(10, 0, 0).date_naive()) && e.on(at(11, 0, 0).date_naive()) && !e.on(at(12, 0, 0).date_naive()));
     }
 
     #[test]
@@ -312,6 +351,64 @@ mod tests {
 
         let wrapped = "https://eur02.safelinks.protection.outlook.com/?url=https%3A%2F%2Fteams.microsoft.com%2Fl%2Fmeetup-join%2Fabc&data=x";
         assert_eq!(join_link([wrapped]).unwrap().url, "https://teams.microsoft.com/l/meetup-join/abc");
+    }
+
+    #[test]
+    fn each_service_is_known_by_its_join_links() {
+        for (url, expected) in [
+            ("https://teams.microsoft.com/l/meetup-join/19:meeting_abc@thread.v2/0?context=%7b%7d", "Teams"),
+            ("https://teams.microsoft.com/meet/123456?p=abc", "Teams"),
+            ("https://Teams.Microsoft.com:443/meet/123456", "Teams"),
+            ("https://teams.live.com/meet/9876", "Teams"),
+            ("https://us02web.zoom.us/j/123456?pwd=abc", "Zoom"),
+            ("https://zoom.us/my/someone", "Zoom"),
+            ("https://example.zoom.us/w/123", "Zoom"),
+            ("https://example.zoom.us/s/123", "Zoom"),
+            ("https://meet.google.com/abc-defg-hij?authuser=0", "Google Meet"),
+            ("https://example.webex.com/example/j.php?MTID=abc", "Webex"),
+            ("https://example.webex.com/meet/someone", "Webex"),
+            ("https://example.webex.com/join/someone", "Webex"),
+            ("https://chime.aws/1234567890", "Chime"),
+            ("https://whereby.com/room", "Whereby"),
+            ("https://meet.jit.si/SomeRoom", "Jitsi"),
+        ] {
+            assert_eq!(service(url), Some(expected), "{url}");
+        }
+    }
+
+    #[test]
+    fn links_without_a_meeting_are_not_joined_and_never_panic() {
+        for url in [
+            "https://meet.google.com", "https://meet.google.com?abc-defg-hij", "https://meet.google.com#abc-defg-hij",
+            "https://meet.google.com/?abc-defg-hij", "https://meet.google.com/lookup/abc-defg",
+            "https://chime.aws", "https://chime.aws?x", "https://whereby.com/", "https://whereby.com#room", "https://meet.jit.si?room",
+            "https://teams.microsoft.com", "https://zoom.us", "https://", "https://?", "https:///meet/1",
+        ] {
+            assert_eq!(service(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn links_that_open_another_host_than_they_name_are_not_joined() {
+        for url in [
+            "https://teams.microsoft.com:x@evil.example/meet/1",
+            "https://teams.microsoft.com@evil.example/meet/1",
+            "https://zoom.us:443@evil.example/j/1",
+            "https://evil.example\\.teams.microsoft.com/meet/1",
+            "https://evil.example%2f.teams.microsoft.com/meet/1",
+            "https://teams.microsoft.com.evil.example/meet/1",
+            "https://evilteams.microsoft.com/meet/1",
+            "https://evil.example#.zoom.us/j/1",
+            "https://zoom.us:x/j/1",
+            "https://zoom.us:443:1/j/1",
+            "https://[::1]/j/1",
+        ] {
+            assert_eq!(service(url), None, "{url}");
+        }
+        let wrapped = "https://eur02.safelinks.protection.outlook.com/?url=https%3A%2F%2Fteams.microsoft.com%3Ax%40evil.example%2Fmeet%2F1&data=x";
+        assert!(join_link([wrapped]).is_none());
+        let fake_wrapper = "https://evil.example/?x=.safelinks.protection.outlook.com&url=https%3A%2F%2Fteams.microsoft.com%2Fmeet%2F1";
+        assert!(join_link([fake_wrapper]).is_none(), "only Safe Links' own host is unwrapped");
     }
 
     #[test]

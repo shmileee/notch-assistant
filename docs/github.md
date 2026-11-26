@@ -42,6 +42,10 @@ Bots never count, and neither do accounts whose login ends in `-bot`, `_bot` or 
 requests they open aren't listed to review. A machine user that looks like a person (a scanner that
 comments, say) goes in "Ignore activity from", as a comma-separated list of logins.
 
+> [!NOTE]
+> At most 100 of your open pull requests are listed: the 100 updated most recently. GitHub gives no
+> more in one search, and the panel says so when you have more.
+
 ## What's unread
 
 Anything that happened after you last read the pull request, either on github.com or from the panel.
@@ -100,10 +104,23 @@ All of them are read-only.
   Renovate and Dependabot ask for the most reviews, so the search leaves them out to fit one page.
   It runs when a new request or a change to a listed one comes, and at least every `REVIEWS_EVERY`.
 
-Without readable notifications (a fine-grained token), your pull requests and the requests to review
-refresh every `BLIND_EVERY` instead.
+Without readable notifications (a fine-grained token, or while they fail to load), your pull requests
+and the requests to review refresh every `BLIND_EVERY` instead.
 
 </details>
 
 To see what it finds without launching the app, run `cargo run --release -- --probe-github`. Unread
 events are marked `*`.
+
+## Notes in the panel
+
+When something doesn't work, the panel keeps showing what it last got, says **Partly live** at the top,
+and adds a note under the list saying what's wrong:
+
+| Note | What it means |
+| --- | --- |
+| To review couldn't refresh, Checks and merge state couldn't refresh | That call to GitHub failed. The panel tries again after a minute, then waits twice as long each time, up to that part's usual delay. |
+| Notifications couldn't refresh | GitHub's notifications didn't answer (the network, or a rate limit). Until they do, your pull requests and the requests to review refresh every `BLIND_EVERY`. |
+| GitHub's notifications aren't readable with this token | GitHub refused them, usually because the token is fine-grained. Use a classic token. |
+| Some organizations hide their pull requests | Authorize the token for that organization's SSO. |
+| Showing the … most recently updated … | A list is longer than the panel reads: your open pull requests (see [What's listed](#whats-listed)) or the requests to review. The rest aren't shown. Nothing is wrong, so the panel still says Live. |

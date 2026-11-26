@@ -6,7 +6,8 @@
 //! before the app first connected: Linear keeps unread notifications for months, and only the
 //! recent ones are news.
 
-use chrono::{Duration, NaiveDateTime};
+use chrono::{Duration};
+use crate::time::Time;
 
 use crate::oncall::Origin;
 use crate::read::ReadState;
@@ -20,7 +21,7 @@ pub fn look_back() -> Duration { Duration::days(7) }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Notice {
     pub id: String,
-    pub at: NaiveDateTime,
+    pub at: Time,
     /// Read in Linear, or snoozed there.
     pub read: bool,
     /// Who did it; empty for Linear's own reminders (an SLA breach, say).
@@ -51,7 +52,7 @@ pub struct Ticket {
     pub assigned: bool,
     /// In a started state (In Progress, In Review).
     pub started: bool,
-    pub updated: NaiveDateTime,
+    pub updated: Time,
     /// Oldest first.
     pub notices: Vec<Notice>,
 }
@@ -101,7 +102,7 @@ pub fn unread_count(list: &[Ticket], read: &ReadState) -> usize {
 
 /// Made-up issues for a made-up team: two with something unread, the same people as the
 /// on-call mock.
-pub fn mock(now: NaiveDateTime) -> Issues {
+pub fn mock(now: Time) -> Issues {
     let ago = |m: i64| now - Duration::minutes(m);
     let notice = |id: &str, m: i64, read: bool, who: &str, headline: &str, excerpt: &str| Notice {
         id: id.into(), at: ago(m), read, who: who.into(), headline: headline.into(), excerpt: excerpt.into(), url: String::new(),
@@ -131,9 +132,7 @@ pub fn mock(now: NaiveDateTime) -> Issues {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
-
-    fn at(h: u32, m: u32) -> NaiveDateTime { NaiveDate::from_ymd_opt(2026, 11, 10).unwrap().and_hms_opt(h, m, 0).unwrap() }
+    fn at(h: u32, m: u32) -> Time { crate::time::at(2026, 11, 10, h, m) }
 
     #[test]
     fn unread_needs_linear_and_the_panel_to_agree() {

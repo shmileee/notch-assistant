@@ -24,6 +24,7 @@ There is no key to paste. The app reads your calendars through macOS, and nothin
 > launch, and if access is off it says so instead of showing mock meetings.
 
 If you turned access off, Settings › Calendar has a button that opens the right page of System Settings.
+Once you turn it back on there, the panel notices within a minute.
 
 ## What's shown
 
@@ -48,11 +49,16 @@ can't find the meeting, Calendar just opens.
 
 `countdown` and `lead` in [`src/agenda.rs`](../src/agenda.rs) set how early these appear.
 
+> [!NOTE]
+> Only meetings that take your time count down and remind you. An event marked **Free** (a blocked-out
+> slot shown as available) and a meeting on a colleague's shared calendar that you aren't invited to are
+> still listed, but they never lead the section, count down or drop a reminder.
+
 ## What it reads
 
-Today's and tomorrow's events from every calendar, through EventKit, refreshed every `EVERY` in
-[`src/calendar.rs`](../src/calendar.rs). EventKit already splits a repeating meeting into one event per
-occurrence.
+Today's and tomorrow's events from every calendar, through EventKit, refreshed at once when the Calendar
+app reports a change and every `EVERY` in [`src/calendar.rs`](../src/calendar.rs) besides. EventKit
+already splits a repeating meeting into one event per occurrence.
 
 To see what it finds without launching the app, run `cargo run --release -- --probe-calendar`. It never
 asks for access, so it works only once your terminal has it.

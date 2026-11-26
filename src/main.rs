@@ -8,6 +8,7 @@
 //! shows the selected one's data beside it.
 
 mod agenda;
+mod anchor;
 mod calendar;
 mod demo;
 mod feed;
@@ -19,23 +20,27 @@ mod island;
 mod issues;
 mod linear;
 mod login;
+mod net;
 mod notch;
 mod oncall;
 mod pulls;
 mod read;
 mod settings;
 mod store;
+mod time;
 mod view;
+mod wake;
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::OnceLock;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
-use chrono::{Local, NaiveDate, NaiveDateTime};
+use chrono::Local;
+use crate::time::Time;
 use rune::machine::Seq;
-use rune::{Align, App, AppHandle, AppSpec, DisplayTarget, OverlayInput, OverlayLevel, OverlayOptions, OverlayPlacement, OverlaySpec, RunOptions, ScreenEdge, Tx, WindowSpec};
+use rune::{App, AppHandle, AppSpec, DisplayTarget, OverlayHandle, OverlayInput, OverlayLevel, OverlayOptions, OverlayPlacement, OverlaySpec, RunOptions, Tx, WindowSpec};
 
 use agenda::Agenda;
 use island::{Event, Island};
@@ -66,6 +71,8 @@ pub struct Peek {
     pub headline: String,
     pub detail: String,
     pub until: f64,
+    /// For a meeting, its `agenda::Event::key`, so a peek that waited can update its countdown.
+    pub meeting: Option<String>,
 }
 
 /// What a peek shows beside its text.
@@ -78,6 +85,8 @@ pub enum Mark {
 }
 
 const PEEK_SECONDS: f64 = 6.0;
+/// Peeks waiting for the one on show, at most.
+const QUEUED: usize = 4;
 
 pub struct State {
     pub geo: NotchGeo,
@@ -93,17 +102,57 @@ pub struct State {
     pub results: Option<Receiver<Result<Data, String>>>,
     /// Keeps that thread alive; dropping it stops the thread.
     pub control: Option<Sender<()>>,
+    /// Settings being read for each integration's next connection (see `read_settings`).
+    pub reading: Reading,
     pub github: Feed<Pulls>,
+    /// The review requests already announced, kept apart from your own pull requests' so it
+    /// starts counting only once the requests have loaded: counting from a list that failed to
+    /// load would announce every old request.
+    pub reviews_announced: read::Announced,
     pub linear: Feed<Issues>,
     pub calendar: Feed<Agenda>,
     /// The meetings already peeked at as starting, by `agenda::Event::key`.
     pub reminded: HashSet<String>,
     pub peek: Option<Peek>,
+    /// Peeks waiting their turn: behind the one on show, or until no app is full screen.
+    pub queued: VecDeque<Peek>,
     pub waker: Option<rune::Waker>,
     /// Scenes pin the clock and the notch so snapshots are reproducible.
     pub frozen: bool,
     /// The installed app's executable, to restart on a new version or quit once removed.
     pub installed: Option<installed::Watch>,
+    pub anchor: anchor::Anchor,
+}
+
+/// Each integration's settings on their way from `read_settings`.
+#[derive(Default)]
+pub struct Reading {
+    firehydrant: Option<Receiver<Option<firehydrant::Client>>>,
+    github: Option<Receiver<Option<github::Client>>>,
+    linear: Option<Receiver<Option<linear::Client>>>,
+}
+
+/// Reads an integration's saved settings on a thread and wakes the panel with them. Secrets come
+/// from the Keychain, which blocks for as long as its unlock prompt is up, and the panel must
+/// keep drawing meanwhile.
+fn read_settings<C: Send + 'static>(read: fn() -> Option<C>, wake: rune::Waker) -> Receiver<Option<C>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(read()); wake(); });
+    rx
+}
+
+/// Connects each integration whose settings have arrived. True when any did.
+fn take_settings(s: &mut State) -> bool {
+    fn take<C>(rx: &mut Option<Receiver<Option<C>>>) -> Option<Option<C>> {
+        let got = rx.as_ref()?.try_recv().ok()?;
+        *rx = None;
+        Some(got)
+    }
+    let mut changed = false;
+    if let Some(client) = take(&mut s.reading.firehydrant) { start_firehydrant(s, client); changed = true; }
+    if let Some(client) = take(&mut s.reading.github) { start_github(s, client); changed = true; }
+    if let Some(client) = take(&mut s.reading.linear) { start_linear(s, client); changed = true; }
+    changed
 }
 
 /// Mock data only: headless tooling, or `NOTCH_MOCK`. Set once in `main`.
@@ -120,10 +169,13 @@ thread_local! {
     static SETTINGS: RefCell<Option<AppHandle<settings::Settings>>> = const { RefCell::new(None) };
     /// Demo mode: where Settings opens (a display and a rect in its points).
     static SETTINGS_PLACE: RefCell<Option<(DisplayTarget, OverlayPlacement)>> = const { RefCell::new(None) };
+    /// The panel, for `anchor` to put back where it belongs.
+    static OVERLAY: RefCell<Option<OverlayHandle<State>>> = const { RefCell::new(None) };
 }
 
 pub fn open_settings() {
     SETTINGS.with(|s| if let Some(handle) = s.borrow().as_ref() {
+        handle.update(|s, _| s.load());
         if let Some((display, rect)) = SETTINGS_PLACE.with(|p| p.borrow().clone()) { handle.place(display, rect); }
         handle.open();
         handle.focus();
@@ -147,7 +199,7 @@ fn relaunch() {
 }
 
 /// The time the panel shows: pinned in demo mode.
-fn now() -> NaiveDateTime { if demo::on() { demo::time() } else { Local::now().naive_local() } }
+fn now() -> Time { if demo::on() { demo::time() } else { Local::now() } }
 
 /// Who "you" are in the mock rotation (`NOTCH_ME`, default OP).
 fn mock_me() -> String { std::env::var("NOTCH_ME").unwrap_or_else(|_| "OP".into()) }
@@ -165,14 +217,18 @@ fn init() -> State {
         data,
         results: None,
         control: None,
+        reading: Reading::default(),
         github: Feed::new(pulls::mock(now()), mock_read()),
+        reviews_announced: read::Announced::default(),
         linear: Feed::new(issues::mock(now()), mock_read()),
         calendar: Feed::new(agenda::mock(now()), mock_read()),
         reminded: HashSet::new(),
         peek: None,
+        queued: VecDeque::new(),
         waker: None,
         frozen: false,
         installed: installed::Watch::new(),
+        anchor: anchor::Anchor::default(),
     }
 }
 
@@ -184,6 +240,8 @@ fn mock_only() -> bool { demo::on() || *MOCK_ONLY.get().unwrap_or(&false) }
 /// The overlay's setup: keep the waker and connect.
 fn start_fetching(s: &mut State, wake: rune::Waker) {
     s.waker = Some(wake);
+    wake::watch();
+    calendar::watch_changes();
     connect_firehydrant(s);
     connect_github(s);
     connect_linear(s);
@@ -212,11 +270,21 @@ fn connect_firehydrant(s: &mut State) {
         s.snap = Snapshot::build(&s.data, now());
         return;
     }
-    let client = if *MOCK_ONLY.get().unwrap_or(&false) { None } else { firehydrant::Client::from_settings() };
+    match s.waker.clone().filter(|_| !*MOCK_ONLY.get().unwrap_or(&false)) {
+        Some(wake) => {
+            s.reading.firehydrant = Some(read_settings(firehydrant::Client::from_settings, wake));
+            s.data = Data::loading();
+        }
+        None => s.data = oncall::mock(&mock_me(), now()),
+    }
+    s.snap = Snapshot::build(&s.data, now());
+}
+
+fn start_firehydrant(s: &mut State, client: Option<firehydrant::Client>) {
     match (client, s.waker.clone()) {
         (Some(client), Some(wake)) => {
             let (tx, rx) = std::sync::mpsc::channel();
-            s.control = Some(firehydrant::spawn(client, tx, wake));
+            s.control = Some(feed::every("firehydrant", Duration::from_secs(300), move || client.fetch(now()), tx, wake));
             s.results = Some(rx);
             s.data = Data::loading();
         }
@@ -227,8 +295,18 @@ fn connect_firehydrant(s: &mut State) {
 
 /// (Re)connects to GitHub with the saved settings, as `connect_firehydrant` does.
 fn connect_github(s: &mut State) {
-    if s.peek.as_ref().is_some_and(|p| p.section == Section::GitHub) { s.peek = None; }
-    let client = if mock_only() { None } else { github::Client::from_settings() };
+    forget_peeks(s, Section::GitHub);
+    s.reviews_announced = read::Announced::default();
+    match s.waker.clone().filter(|_| !mock_only()) {
+        Some(wake) => {
+            s.reading.github = Some(read_settings(github::Client::from_settings, wake));
+            s.github.show(Pulls::loading(), mock_read());
+        }
+        None => start_github(s, None),
+    }
+}
+
+fn start_github(s: &mut State, client: Option<github::Client>) {
     match (client, s.waker.clone()) {
         (Some(client), Some(wake)) => s.github.start("github", github::EVERY, client.fetcher(), wake, Pulls::loading(),
             ReadState::load(pulls::READ_FILE, now())),
@@ -241,30 +319,40 @@ fn connect_github(s: &mut State) {
 }
 
 /// Takes in finished GitHub fetches and peeks the newest new event, unless the panel is open.
+/// Only good data counts toward what's new: after a failure the list is still empty, and
+/// counting from it would make the next good fetch announce everything already unread.
 fn take_pulls(s: &mut State, clock: f64) -> bool {
     let gh = &mut s.github;
-    let arrived = gh.take(|read, pulls| read.sync(pulls.list.iter().chain(&pulls.reviews).map(|p| (p.id.as_str(), p.read_on_github)), now()));
-    if !arrived { return false; }
-    let mut unread = pulls::unread_events(&gh.data.list, &gh.read);
-    unread.extend(pulls::unread_events(&gh.data.reviews, &gh.read));
-    let new = gh.announced.update(unread);
-    if let (Some((p, a)), false) = (new.into_iter().max_by_key(|(_, a)| a.at), s.island.is_open()) {
-        s.peek = Some(Peek {
-            section: Section::GitHub,
-            pulls: Some(if p.request.is_some() { PullView::Reviews } else { PullView::Yours }),
-            mark: Mark::Person(a.who.clone()),
-            headline: format!("{} on #{}", a.headline(), p.number),
-            detail: if a.excerpt.is_empty() { p.title.clone() } else { a.excerpt.clone() },
-            until: clock + PEEK_SECONDS,
-        });
-    }
+    let took = gh.take(|read, pulls| read.sync(pulls.list.iter().chain(&pulls.reviews).map(|p| (p.id.as_str(), p.read_on_github)), now()));
+    if !took.fresh { return took.changed; }
+    let mut new = gh.announced.update(pulls::unread_events(&gh.data.list, &gh.read));
+    if gh.data.reviews_loaded { new.extend(s.reviews_announced.update(pulls::unread_events(&gh.data.reviews, &gh.read))); }
+    let peek = new.into_iter().max_by_key(|(_, a)| a.at).filter(|_| !s.island.is_open()).map(|(p, a)| Peek {
+        section: Section::GitHub,
+        pulls: Some(if p.request.is_some() { PullView::Reviews } else { PullView::Yours }),
+        mark: Mark::Person(a.who.clone()),
+        headline: format!("{} on #{}", a.headline(), p.number),
+        detail: if a.excerpt.is_empty() { p.title.clone() } else { a.excerpt.clone() },
+        until: 0.0,
+        meeting: None,
+    });
+    if let Some(peek) = peek { offer(s, peek, clock); }
     true
 }
 
 /// (Re)connects to Linear with the saved settings, as `connect_firehydrant` does.
 fn connect_linear(s: &mut State) {
-    if s.peek.as_ref().is_some_and(|p| p.section == Section::Linear) { s.peek = None; }
-    let client = if mock_only() { None } else { linear::Client::from_settings() };
+    forget_peeks(s, Section::Linear);
+    match s.waker.clone().filter(|_| !mock_only()) {
+        Some(wake) => {
+            s.reading.linear = Some(read_settings(linear::Client::from_settings, wake));
+            s.linear.show(Issues::loading(), mock_read());
+        }
+        None => start_linear(s, None),
+    }
+}
+
+fn start_linear(s: &mut State, client: Option<linear::Client>) {
     match (client, s.waker.clone()) {
         (Some(client), Some(wake)) => s.linear.start("linear", linear::EVERY, client.fetcher(), wake, Issues::loading(),
             ReadState::load(issues::READ_FILE, now() - issues::look_back())),
@@ -279,27 +367,26 @@ fn connect_linear(s: &mut State) {
 /// Takes in finished Linear fetches and peeks the newest new notification, as `take_pulls` does.
 fn take_issues(s: &mut State, clock: f64) -> bool {
     let ln = &mut s.linear;
-    let arrived = ln.take(|read, found| read.sync(found.list.iter().map(|t| (t.id.as_str(), None)), now()));
-    if !arrived { return false; }
+    let took = ln.take(|read, found| read.sync(found.list.iter().map(|t| (t.id.as_str(), None)), now()));
+    if !took.fresh { return took.changed; }
     let new = ln.announced.update(issues::unread_events(&ln.data.list, &ln.read));
-    if let (Some((t, n)), false) = (new.into_iter().max_by_key(|(_, n)| n.at), s.island.is_open()) {
-        let on = if t.key.is_empty() { t.title.clone() } else { t.key.clone() };
-        s.peek = Some(Peek {
-            section: Section::Linear,
-            pulls: None,
-            mark: Mark::Person(if n.who.is_empty() { "Linear".into() } else { n.who.clone() }),
-            headline: format!("{} on {on}", n.headline),
-            detail: if n.excerpt.is_empty() { t.title.clone() } else { n.excerpt.clone() },
-            until: clock + PEEK_SECONDS,
-        });
-    }
+    let peek = new.into_iter().max_by_key(|(_, n)| n.at).filter(|_| !s.island.is_open()).map(|(t, n)| Peek {
+        section: Section::Linear,
+        pulls: None,
+        mark: Mark::Person(if n.who.is_empty() { "Linear".into() } else { n.who.clone() }),
+        headline: format!("{} on {}", n.headline, if t.key.is_empty() { &t.title } else { &t.key }),
+        detail: if n.excerpt.is_empty() { t.title.clone() } else { n.excerpt.clone() },
+        until: 0.0,
+        meeting: None,
+    });
+    if let Some(peek) = peek { offer(s, peek, clock); }
     true
 }
 
 /// (Re)connects to the Calendar app, as `connect_firehydrant` does. Once access was granted,
 /// losing it shows as an error rather than as the mock.
 fn connect_calendar(s: &mut State) {
-    if s.peek.as_ref().is_some_and(|p| p.section == Section::Calendar) { s.peek = None; }
+    forget_peeks(s, Section::Calendar);
     let live = !mock_only() && (calendar::INTEGRATION.configured() || calendar::enabled());
     match (live, s.waker.clone()) {
         (true, Some(wake)) => {
@@ -317,23 +404,70 @@ fn connect_calendar(s: &mut State) {
 /// Takes in finished calendar reads, and peeks once at each meeting about to start. The peek
 /// waits while the panel is open.
 fn take_agenda(s: &mut State, clock: f64) -> bool {
-    if calendar::answered() { connect_calendar(s); }
-    let arrived = s.calendar.take(|_, _| {});
+    // Both are read every time: each remembers what it last saw.
+    if calendar::answered() | calendar::access_changed() { connect_calendar(s); }
+    if calendar::take_changed() { s.calendar.refresh(); }
+    let arrived = s.calendar.take(|_, _| {}).changed;
     let events = &s.calendar.data.events;
     if arrived { s.reminded.retain(|key| events.iter().any(|e| e.key() == *key)); }
     if !matches!(s.calendar.data.origin, Origin::Live { .. }) || s.island.is_open() { return arrived; }
     let now = now();
     let Some(e) = agenda::starting(events, now, agenda::lead()).into_iter().find(|e| !s.reminded.contains(&e.key())) else { return arrived };
     s.reminded.insert(e.key());
-    s.peek = Some(Peek {
+    let peek = Peek {
         section: Section::Calendar,
         pulls: None,
         mark: Mark::Countdown { text: agenda::until(e.start - now), color: e.color },
         headline: e.title.clone(),
         detail: format!("Starts at {} · {}", e.start.format("%H:%M"), e.place()),
-        until: clock + PEEK_SECONDS,
-    });
+        until: 0.0,
+        meeting: Some(e.key()),
+    };
+    offer(s, peek, clock);
     true
+}
+
+/// Drops the peeks, on show or waiting, of an integration that is reconnecting.
+fn forget_peeks(s: &mut State, section: Section) {
+    if s.peek.as_ref().is_some_and(|p| p.section == section) { s.peek = None; }
+    s.queued.retain(|q| q.section != section);
+}
+
+/// Shows a peek now, or once the ones before it have had their turn. Meetings go before the
+/// rest, and a newer peek for the same list takes the place of one still waiting. Nothing shows
+/// while an app is full screen where the panel is, so a slideshow or a shared screen doesn't
+/// get a comment or an incident dropped over it.
+fn offer(s: &mut State, peek: Peek, clock: f64) {
+    if s.peek.is_none() && s.queued.is_empty() && !notch::full_screen_under_pointer() {
+        s.peek = Some(Peek { until: clock + PEEK_SECONDS, ..peek });
+        return;
+    }
+    queue(&mut s.queued, peek);
+}
+
+fn queue(queued: &mut VecDeque<Peek>, peek: Peek) {
+    if peek.meeting.is_none() { queued.retain(|q| q.meeting.is_some() || (q.section, q.pulls) != (peek.section, peek.pulls)); }
+    let at = if peek.meeting.is_some() { queued.iter().take_while(|q| q.meeting.is_some()).count() } else { queued.len() };
+    queued.insert(at, peek);
+    while queued.len() > QUEUED {
+        let oldest = queued.iter().position(|q| q.meeting.is_none()).unwrap_or(0);
+        queued.remove(oldest);
+    }
+}
+
+/// The next waiting peek that still means something: a meeting that hasn't started, with its
+/// countdown brought up to now.
+fn next_peek(s: &mut State, clock: f64) -> Option<Peek> {
+    let now = now();
+    while let Some(mut peek) = s.queued.pop_front() {
+        if let Some(key) = &peek.meeting {
+            let Some(e) = s.event(key).filter(|e| e.start > now) else { continue };
+            peek.mark = Mark::Countdown { text: agenda::until(e.start - now), color: e.color };
+        }
+        peek.until = clock + PEEK_SECONDS;
+        return Some(peek);
+    }
+    None
 }
 
 impl State {
@@ -391,15 +525,19 @@ impl State {
 /// Takes in finished fetches. A failure keeps the last good data and says so.
 fn take_results(s: &mut State) -> bool {
     let Some(rx) = &s.results else { return false };
-    let mut changed = false;
-    while let Ok(result) = rx.try_recv() {
-        match result {
-            Ok(data) => s.data = data,
-            Err(message) => {
-                let stale = match &s.data.origin { Origin::Live { at } => Some(*at), Origin::Error { stale, .. } => *stale, _ => None };
-                s.data.origin = Origin::Error { message, stale };
-            }
+    let (mut changed, mut stopped) = (false, false);
+    loop {
+        match rx.try_recv() {
+            Ok(Ok(data)) => s.data = data,
+            Ok(Err(message)) => feed::fail(&mut s.data.origin, message),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => { stopped = true; break; }
         }
+        changed = true;
+    }
+    if stopped {
+        (s.results, s.control) = (None, None);
+        feed::fail(&mut s.data.origin, "Refreshing stopped. Save FireHydrant in Settings to start it again".into());
         changed = true;
     }
     changed
@@ -417,6 +555,7 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
     // The overlay follows the pointer between displays; reshape the island to the notch (real
     // or virtual) of the display it's now on, without animating the jump.
     if !s.frozen {
+        OVERLAY.with(|o| if let Some(overlay) = o.borrow().as_ref() { s.anchor.keep(overlay) });
         let geo = notch::under_pointer();
         if geo != s.geo {
             eprintln!("notch: {geo:?}");
@@ -434,16 +573,33 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
             tx.wake_at(due);
         }
     }
-    if let Some(peek) = s.peek.as_ref().filter(|_| !s.frozen) {
-        if clock >= peek.until || s.island.is_open() {
+    if !s.frozen {
+        if s.island.is_open() {
+            changed |= s.peek.take().is_some() || !s.queued.is_empty();
+            // A meeting still waiting its turn wasn't seen, so it may peek once the panel closes.
+            for waiting in s.queued.drain(..) {
+                if let Some(key) = waiting.meeting { s.reminded.remove(&key); }
+            }
+        } else if s.peek.as_ref().is_some_and(|p| clock >= p.until) {
             s.peek = None;
             changed = true;
-        } else {
-            tx.wake_at(peek.until);
+        }
+        if s.peek.is_none() && !s.queued.is_empty() && !s.island.is_open() && !notch::full_screen_under_pointer() {
+            s.peek = next_peek(s, clock);
+            changed |= s.peek.is_some();
+        }
+        if let Some(peek) = &s.peek { tx.wake_at(peek.until); }
+        if wake::take() {
+            eprintln!("wake: refreshing everything");
+            s.github.refresh();
+            s.linear.refresh();
+            s.calendar.refresh();
+            if let Some(control) = &s.control { let _ = control.send(()); }
         }
     }
     if !s.frozen {
         let t = now();
+        changed |= take_settings(s);
         changed |= take_pulls(s, clock);
         changed |= take_issues(s, clock);
         changed |= take_agenda(s, clock);
@@ -461,10 +617,8 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
 }
 
 /// Tuesday 10 November 2026, 14:05: the user is primary this week.
-fn scene_time(day: u32, h: u32, m: u32) -> NaiveDateTime {
-    NaiveDate::from_ymd_opt(2026, 11, day).unwrap().and_hms_opt(h, m, 0).unwrap()
-}
-fn freeze(s: &mut State, at: NaiveDateTime) {
+fn scene_time(day: u32, h: u32, m: u32) -> Time { time::at(2026, 11, day, h, m) }
+fn freeze(s: &mut State, at: Time) {
     s.frozen = true;
     s.geo = NotchGeo { width: 185.0, height: 32.0, real: true };
     s.data = oncall::mock("OP", at);
@@ -489,14 +643,14 @@ fn spec() -> AppSpec<State> {
                 freeze(s, scene_time(10, 14, 5));
                 let (pull, a) = (&s.github.data.list[0], &s.github.data.list[0].activity[1]);
                 s.peek = Some(Peek { section: Section::GitHub, pulls: Some(PullView::Yours), mark: Mark::Person(a.who.clone()),
-                    headline: format!("{} on #{}", a.headline(), pull.number), detail: a.excerpt.clone(), until: 0.0 });
+                    headline: format!("{} on #{}", a.headline(), pull.number), detail: a.excerpt.clone(), until: 0.0, meeting: None });
             }),
             ("soon", |s| {
                 let at = scene_time(10, 14, 56);
                 freeze(s, at);
                 let e = s.calendar.data.events.iter().find(|e| e.title == "1:1 with ZQ").unwrap();
                 s.peek = Some(Peek { section: Section::Calendar, pulls: None, mark: Mark::Countdown { text: agenda::until(e.start - at), color: e.color },
-                    headline: e.title.clone(), detail: format!("Starts at {} · {}", e.start.format("%H:%M"), e.place()), until: 0.0 });
+                    headline: e.title.clone(), detail: format!("Starts at {} · {}", e.start.format("%H:%M"), e.place()), until: 0.0, meeting: Some(e.key()) });
             }),
         ],
         poll: Some(poll),
@@ -542,7 +696,7 @@ fn probe_github() {
             let read = ReadState::load(pulls::READ_FILE, now());
             println!("you are {}: {} pull requests, {} with something unread; {} to review, {} new that count",
                 found.login, found.list.len(), pulls::unread_count(&found.list, &read), found.reviews.len(), pulls::unread_count(&found.reviews, &read));
-            for w in &found.warnings { println!("note: {w}"); }
+            for w in &found.trouble { println!("note: {w}"); }
             for (title, list) in [("yours", &found.list), ("to review", &found.reviews)] {
                 println!("{title}:");
                 for (p, _) in pulls::shown(list, &read) {
@@ -619,6 +773,13 @@ fn main() {
     let _ = MOCK_ONLY.set(headless || std::env::var_os("NOTCH_MOCK").is_some());
     let _ = HEADLESS.set(headless);
     if sandboxed() { store::use_memory(); }
+    // Held until the process exits.
+    let _lock = if sandboxed() { None } else {
+        match store::single_instance() {
+            Ok(lock) => lock,
+            Err(store::Running) => { eprintln!("Notch Assistant is already running; quitting this copy."); return; }
+        }
+    };
 
     rune::prewarm_gpu();
     rune::run_windows_with(RunOptions { accessory: true }, move |displays| {
@@ -637,14 +798,16 @@ fn main() {
             // On the display under the pointer, moving with it from screen to screen.
             display: DisplayTarget::UnderPointer,
             follow_pointer: true,
-            placement: Some(OverlayPlacement::Edge { edge: ScreenEdge::Top, margin: 0.0, align: Align::Center, inset: 0.0 }),
+            placement: Some(anchor::PLACEMENT),
             // Above the menu bar; only the island itself (`.hit()`) takes the pointer.
             level: if demo::on() { OverlayLevel::AboveOverlays } else { OverlayLevel::AboveStatus },
             input: OverlayInput::Regions,
             prewarm: true,
+            exclude_from_capture: !settings::in_capture(),
             ..Default::default()
         }).setup(start_fetching), init());
         overlay.show();
+        OVERLAY.with(|o| *o.borrow_mut() = Some(overlay.clone()));
         // Settings: an ordinary window, hidden until opened from the panel.
         let spec = AppSpec { setup: Some(settings::setup), poll: Some(settings::poll),
             ..AppSpec::new("Notch assistant settings", demo::SETTINGS_SIZE, || settings::Settings::new(None), settings::view) };
@@ -672,4 +835,43 @@ fn main() {
         // The headless tools snapshot this (never shown) window with the same view and scenes.
         vec![WindowSpec::from_app("notch", app).options(rune::WindowOptions { transparent: true, ..Default::default() })]
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peek(section: Section, headline: &str, meeting: bool) -> Peek {
+        Peek { section, pulls: (section == Section::GitHub).then_some(PullView::Yours), mark: Mark::Person("ZQ".into()),
+            headline: headline.into(), detail: String::new(), until: 0.0, meeting: meeting.then(|| headline.to_string()) }
+    }
+
+    fn headlines(q: &VecDeque<Peek>) -> Vec<&str> { q.iter().map(|p| p.headline.as_str()).collect() }
+
+    #[test]
+    fn meetings_wait_ahead_of_the_rest_and_two_at_once_both_show() {
+        let mut q = VecDeque::new();
+        queue(&mut q, peek(Section::GitHub, "comment", false));
+        queue(&mut q, peek(Section::Calendar, "standup", true));
+        queue(&mut q, peek(Section::Calendar, "1:1", true));
+        assert_eq!(headlines(&q), ["standup", "1:1", "comment"]);
+    }
+
+    #[test]
+    fn a_newer_peek_for_the_same_list_replaces_the_waiting_one() {
+        let mut q = VecDeque::new();
+        queue(&mut q, peek(Section::GitHub, "old comment", false));
+        queue(&mut q, peek(Section::Linear, "mention", false));
+        queue(&mut q, peek(Section::GitHub, "new comment", false));
+        assert_eq!(headlines(&q), ["mention", "new comment"]);
+    }
+
+    #[test]
+    fn the_queue_drops_the_oldest_non_meeting_when_full() {
+        let mut q = VecDeque::new();
+        queue(&mut q, peek(Section::GitHub, "comment", false));
+        queue(&mut q, peek(Section::Linear, "mention", false));
+        for m in ["a", "b", "c"] { queue(&mut q, peek(Section::Calendar, m, true)); }
+        assert_eq!(headlines(&q), ["a", "b", "c", "mention"]);
+    }
 }
