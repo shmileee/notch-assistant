@@ -10,7 +10,7 @@ use rune::tok::{self, TextStyle};
 use rune::{Color, Cx, El, OverlayHandle, TextEdit, Tx, Waker, col, el, row, spacer, text};
 use rune_kit::{Button, ButtonVariant, Kit, Switch, TextInput};
 
-use crate::integrations::{ALL, FieldKind, Integration};
+use crate::integrations::{ALL, Access, FieldKind, Integration, Permission};
 use crate::login::{self, Login};
 use crate::store;
 
@@ -25,6 +25,8 @@ pub struct Settings {
     pub saved: Vec<bool>,
     pub status: Status,
     tests: Option<Receiver<Result<String, String>>>,
+    /// A permission prompt waiting for its answer.
+    asking: Option<Receiver<()>>,
     waker: Option<Waker>,
     /// The panel, told to reconnect when settings change.
     panel: Option<OverlayHandle<crate::State>>,
@@ -34,7 +36,7 @@ pub struct Settings {
 
 impl Settings {
     pub fn new(panel: Option<OverlayHandle<crate::State>>) -> Self {
-        let mut s = Settings { selected: 0, edits: vec![], saved: vec![], status: Status::Idle, tests: None, waker: None, panel, login: Login::Unavailable };
+        let mut s = Settings { selected: 0, edits: vec![], saved: vec![], status: Status::Idle, tests: None, asking: None, waker: None, panel, login: Login::Unavailable };
         s.load();
         s
     }
@@ -47,8 +49,9 @@ impl Settings {
         self.edits = i.fields.iter().map(|f| match f.kind {
             FieldKind::Secret => TextEdit::new("").secure(),
             FieldKind::Text => TextEdit::new(&store::setting(i.id, f.key).unwrap_or_default()),
+            FieldKind::Permission(_) => TextEdit::new(""),
         }).collect();
-        self.saved = i.fields.iter().map(|f| f.kind == FieldKind::Secret && i.value(f.key).is_some()).collect();
+        self.saved = i.fields.iter().map(|f| matches!(f.kind, FieldKind::Secret) && i.value(f.key).is_some()).collect();
         // The demo and snapshots never touch the real login items.
         self.login = if crate::sandboxed() { Login::Off } else { login::status() };
     }
@@ -80,9 +83,10 @@ impl Settings {
                 FieldKind::Secret if value.is_empty() => Ok(()), // keep the saved one
                 FieldKind::Secret => store::set_secret(i.id, f.key, &value),
                 FieldKind::Text => store::set_setting(i.id, f.key, &value),
+                FieldKind::Permission(_) => Ok(()),
             };
             if let Err(e) = result { self.status = Status::Err(format!("{}: {e}", f.label)); return; }
-            if f.kind == FieldKind::Secret { edit.clear(); }
+            if matches!(f.kind, FieldKind::Secret) { edit.clear(); }
         }
         self.load();
         self.reconnect_panel();
@@ -91,7 +95,7 @@ impl Settings {
 
     fn remove_secrets(&mut self) {
         let i = self.integration();
-        for f in i.fields.iter().filter(|f| f.kind == FieldKind::Secret) {
+        for f in i.fields.iter().filter(|f| matches!(f.kind, FieldKind::Secret)) {
             store::delete_secret(i.id, f.key);
             for (_, service) in i.legacy.iter().filter(|(field, _)| *field == f.key) { store::delete_legacy(service); }
         }
@@ -103,6 +107,18 @@ impl Settings {
     fn reconnect_panel(&self) {
         let id = self.integration().id;
         if let Some(panel) = &self.panel { panel.update(move |s, _| crate::reconnect(s, id)); }
+    }
+
+    /// Shows the system prompt; `poll` reconnects and tests once it's answered.
+    fn ask(&mut self, permission: &'static Permission) {
+        let (tx, rx) = channel();
+        let waker = self.waker.clone();
+        (permission.request)(Box::new(move || {
+            let _ = tx.send(());
+            if let Some(wake) = waker { wake(); }
+        }));
+        self.asking = Some(rx);
+        self.status = Status::Busy("Waiting for your answer…");
     }
 
     fn test(&mut self, _: &mut Tx) {
@@ -119,7 +135,14 @@ impl Settings {
 
 pub fn setup(s: &mut Settings, waker: Waker) { s.waker = Some(waker); }
 
-pub fn poll(s: &mut Settings, _: f64, _: &mut Tx) -> bool {
+pub fn poll(s: &mut Settings, _: f64, tx: &mut Tx) -> bool {
+    if s.asking.as_ref().is_some_and(|rx| rx.try_recv().is_ok()) {
+        s.asking = None;
+        s.load();
+        s.reconnect_panel();
+        s.test(tx);
+        return true;
+    }
     let Some(result) = s.tests.as_ref().and_then(|rx| rx.try_recv().ok()) else { return false };
     s.tests = None;
     s.status = match result { Ok(m) => Status::Ok(m), Err(e) => Status::Err(e) };
@@ -132,6 +155,7 @@ pub fn view(s: &Settings, cx: &mut Cx<Settings>) -> El {
     let dark = cx.system_dark();
     let (th, k) = (tok::theme(dark), Kit::neutral(dark));
     let green = Color { r: 0.2, g: 0.78, b: 0.45, a: 1.0 };
+    let amber = Color { r: 0.95, g: 0.65, b: 0.2, a: 1.0 };
 
     let mut sidebar = col().w(190.0).h_full().gap(2.0).padding(12.0).pt(40.0).fill(th.card)
         .child(text("INTEGRATIONS").font(t(10.5, 650.0).tracking(0.5)).color(th.text_secondary).pb(6.0).px(8.0));
@@ -161,6 +185,34 @@ pub fn view(s: &Settings, cx: &mut Cx<Settings>) -> El {
             .child(text(i.name).font(t(20.0, 650.0)).color(th.text))
             .child(text(i.summary).font(t(13.0, 400.0)).color(th.text_secondary)));
     for (index, f) in i.fields.iter().enumerate() {
+        if let FieldKind::Permission(p) = f.kind {
+            let access = (p.status)();
+            let (state, color) = match access {
+                Access::Granted => ("● allowed", green),
+                Access::NotAsked => ("not allowed yet", th.text_secondary),
+                Access::Denied => ("● turned off", amber),
+                Access::Restricted => ("● blocked by whoever manages this Mac", amber),
+                Access::Unavailable => ("needs the installed app", th.text_secondary),
+            };
+            let mut block = col().gap(6.0)
+                .child(row().gap(8.0).items_center()
+                    .child(text(f.label).font(t(12.5, 600.0)).color(th.text))
+                    .child(text(state).font(t(11.0, 500.0)).color(color)))
+                .child(text(f.help).font(t(11.5, 400.0)).color(th.text_secondary).wrap());
+            block = match access {
+                Access::NotAsked => block.child(row().pt(4.0).child(Button::new("Allow access").variant(ButtonVariant::Contrast)
+                    .on_press(move |s: &mut Settings| s.ask(p)).build(&k).key("allow"))),
+                Access::Denied => block
+                    .child(text("Turn on Notch Assistant in System Settings › Privacy & Security › Calendars.").font(t(11.5, 500.0)).color(amber).wrap())
+                    .child(row().pt(4.0).child(Button::new("Open System Settings").variant(ButtonVariant::Outline)
+                        .on_press(move |_: &mut Settings| (p.open_settings)()).build(&k).key("open-privacy"))),
+                Access::Unavailable => block.child(text("macOS asks only on behalf of the app bundle: install it (make install or brew) and allow it there.")
+                    .font(t(11.5, 500.0)).color(th.text_secondary).wrap()),
+                Access::Granted | Access::Restricted => block,
+            };
+            form = form.child(block);
+            continue;
+        }
         let placeholder = match f.kind {
             FieldKind::Secret if s.saved[index] => "Saved in Keychain · paste a new one to replace".to_string(),
             _ => (f.placeholder)(),
@@ -168,7 +220,7 @@ pub fn view(s: &Settings, cx: &mut Cx<Settings>) -> El {
         let mut input = TextInput::new(&s.edits[index]).placeholder(placeholder).width(Some(440.0))
             .on_edit(move |s: &mut Settings| &mut s.edits[index])
             .on_submit(|s: &mut Settings, tx| s.save(tx));
-        if f.kind == FieldKind::Secret { input = input.secure(); }
+        if matches!(f.kind, FieldKind::Secret) { input = input.secure(); }
         let mut block = col().gap(6.0)
             .child(row().gap(8.0).items_center()
                 .child(text(f.label).font(t(12.5, 600.0)).color(th.text))
@@ -182,8 +234,11 @@ pub fn view(s: &Settings, cx: &mut Cx<Settings>) -> El {
     }
 
     let has_secret = s.saved.iter().any(|b| *b);
-    let mut actions = row().gap(8.0).items_center()
-        .child(Button::new("Save").variant(ButtonVariant::Contrast).on_press_tx(|s: &mut Settings, tx| s.save(tx)).build(&k).key("save"))
+    let mut actions = row().gap(8.0).items_center();
+    if i.fields.iter().any(|f| !matches!(f.kind, FieldKind::Permission(_))) {
+        actions = actions.child(Button::new("Save").variant(ButtonVariant::Contrast).on_press_tx(|s: &mut Settings, tx| s.save(tx)).build(&k).key("save"));
+    }
+    actions = actions
         .child(Button::new("Test connection").variant(ButtonVariant::Outline).on_press_tx(|s: &mut Settings, tx| s.test(tx)).build(&k).key("test"));
     if has_secret {
         actions = actions.child(spacer()).child(Button::new("Remove key").variant(ButtonVariant::Danger).on_press(|s: &mut Settings| s.remove_secrets()).build(&k).key("remove"));

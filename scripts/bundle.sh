@@ -35,6 +35,8 @@ cat >"$app/Contents/Info.plist" <<PLIST
   <key>LSUIElement</key><true/>
   <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSCalendarsFullAccessUsageDescription</key><string>Notch Assistant shows your meetings from every calendar in the Calendar app.</string>
+  <key>NSCalendarsUsageDescription</key><string>Notch Assistant shows your meetings from every calendar in the Calendar app.</string>
 </dict>
 </plist>
 PLIST

@@ -1,8 +1,8 @@
 # Notch Assistant
 
 A Dynamic-Island-style panel for the MacBook notch that shows your FireHydrant on-call rotation and
-incidents, your GitHub pull requests and the ones you're asked to review, and your Linear issues and notifications, built
-with [Rune](https://github.com/anomalyco/rune). Hover the notch and it springs open; move away and it closes
+incidents, your GitHub pull requests and the ones you're asked to review, your Linear issues and notifications, and
+your meetings from the Calendar app, built with [Rune](https://github.com/anomalyco/rune). Hover the notch and it springs open; move away and it closes
 after a short grace period. On an external display it sits in the middle of the menu bar as a "virtual
 notch".
 
@@ -17,6 +17,10 @@ notch".
 | Your pull requests | To review | Linear |
 | --- | --- | --- |
 | ![](snaps/pulls.png) | ![](snaps/reviews.png) | ![](snaps/linear.png) |
+
+| Calendar | A meeting soon |
+| --- | --- |
+| ![](snaps/calendar.png) | ![](snaps/soon.png) |
 
 ## What it shows
 
@@ -33,10 +37,13 @@ The open panel has a sidebar of integrations, each with its count; pick one and 
   - **To review:** others' pull requests waiting for your review or a team's, new requests first.
 - **Linear:** issues and projects with notifications you haven't read (mentions, comments, status
   changes, assignments, SLA breaches), then your open issues.
+- **Calendar:** the meeting you're in or your next one, with a Join button for its call, the rest of today
+  and tomorrow, and today on a timeline, from every calendar in the Calendar app.
 - **Collapsed:** a dot left of the notch (green: you're primary, amber: secondary, grey: off call), a count
-  beside it for each integration with something unread (purple: GitHub, indigo: Linear), and the current
-  primary's avatar on the right. When something new arrives, the island drops a line under the notch for
-  six seconds saying what; hovering it opens that integration.
+  beside it for each integration with something unread (purple: GitHub, indigo: Linear), a countdown to a
+  meeting that starts soon, and the current primary's avatar on the right. When something new arrives or a
+  meeting is about to start, the island drops a line under the notch for six seconds saying what; hovering
+  it opens that integration.
 
 In GitHub and Linear, a click opens the item where the unread part starts and marks it read. Until an
 integration is connected, it shows mock data, labelled "Mock data · Connect" in the panel.
@@ -59,7 +66,8 @@ make uninstall     # stops it and removes the app and the login item (settings a
 `INSTALL_DIR=/Applications` installs it for every user; `LOGIN=0` skips open at login.
 
 Then open the panel, click ⚙, and add your FireHydrant API key and team ID (see [FireHydrant](#firehydrant)),
-a GitHub token and a Linear API key (see [GitHub and Linear](#github-and-linear)).
+a GitHub token and a Linear API key (see [GitHub and Linear](#github-and-linear)), and allow calendar access
+(see [Calendar](#calendar)).
 
 - **Quitting:** the × in the open panel, or ⌘Q while Settings is in front.
 - **Open at login:** a switch at the bottom left of Settings, also in System Settings › General › Login
@@ -103,12 +111,18 @@ the service. How to create them, what counts, and what each one calls:
 - [docs/github.md](docs/github.md)
 - [docs/linear.md](docs/linear.md)
 
+## Calendar
+
+Calendar needs no key: it reads every account in the Calendar app through macOS, once you click Allow
+access in Settings › Calendar. What it shows and what to do when macOS asks again after an upgrade:
+[docs/calendar.md](docs/calendar.md).
+
 ## Development
 
 ```sh
 cargo run --release                                        # run it (stop the installed copy first)
 cargo test
-cargo run -- --scene open --snap snaps/open.png           # scenes: collapsed, open, incidents, offhours, pulls, reviews, linear, peek
+cargo run -- --scene open --snap snaps/open.png           # scenes: collapsed, open, incidents, offhours, pulls, reviews, linear, calendar, peek, soon
 cargo run -- --scene collapsed --script scripts/hover.json --snap mid.png --at 0.75
 ```
 
@@ -144,22 +158,24 @@ proposes the cask update. `make icon` redraws `assets/AppIcon.icns`.
 | `src/github.rs` | The GitHub client and its integration declaration. |
 | `src/issues.rs` | Linear issues, projects and notifications, and the mock. |
 | `src/linear.rs` | The Linear client and its integration declaration. |
+| `src/agenda.rs` | Meetings, what the Calendar section picks from them at a given moment, join links, and the mock. |
+| `src/calendar.rs` | The EventKit client, the calendar permission and its integration declaration. |
 | `src/feed.rs` | A notifying integration's data, read state and refresh thread. |
 | `src/read.rs` | What you've read of each, and which unread events are new since the last refresh. |
-| `src/integrations.rs` | The integration registry: each one's fields (`Secret` or `Text`), env overrides and connection test. |
+| `src/integrations.rs` | The integration registry: each one's fields (`Secret`, `Text` or a macOS `Permission`), env overrides and connection test. |
 | `src/store.rs` | Secrets in the Keychain (written via `security -i`, never on a command line), the rest in settings.json. |
 | `src/settings.rs` | The Settings window, built from the registry. |
 | `src/login.rs` | Open at login (`SMAppService`); only the app bundle can register. |
 | `src/installed.rs` | Restarts the app when its installed copy is replaced and quits it when removed. |
 | `src/demo.rs` | Demo mode for recordings. |
-| `scripts/bundle.sh`, `Makefile` | The app bundle (Info.plist, icon, ad-hoc signature), install, uninstall and release zip. |
+| `scripts/bundle.sh`, `Makefile` | The app bundle (Info.plist with the calendar usage text, icon, ad-hoc signature), install, uninstall and release zip. |
 
-**Adding an integration.** Declare an `Integration` (fields, required secret, test) and add it to
+**Adding an integration.** Declare an `Integration` (its fields, the one it can't run without, and a test) and add it to
 `integrations::ALL`; it appears in Settings, and its values come from `integration.value(key)`. Fetch its
 data on a worker thread: a `feed::Feed` does that, keeps read state and spots new events, as GitHub and
 Linear use it. Give it a `Section` (its sidebar entry and view in `view.rs`) and add a mock so scenes and
 demo mode keep working. Another kind of sign-in (OAuth, say) is a new `FieldKind` with its own control in
-`settings.rs`.
+`settings.rs`, as the calendar's `Permission` has.
 
 ## License
 

@@ -3,25 +3,30 @@
 //! beside the notch says where that data comes from and holds the clock; the notch itself
 //! hides whatever is drawn behind it, so content starts below it.
 
-use chrono::{Duration, NaiveDateTime};
+use chrono::{Duration, NaiveDateTime, NaiveTime};
 use rune::tok::TextStyle;
 use rune::{Color, Cx, El, ScrollSpec, Spring, Transition, Tx, col, el, row, spacer, text};
 
+use crate::agenda::{self, Day, Focus, Join, Reply};
 use crate::island::{self, Event};
 use crate::oncall::{Incident, Origin, Role, Shift, Snapshot, Week, initials, span, when};
 use crate::issues::{self, Notice, Ticket};
 use crate::pulls::{self, Activity, Checks, Merge, Pull, Request, Review, Status};
-use crate::{FireView, Peek, PullView, Section, State};
+use crate::{FireView, Mark, Peek, PullView, Section, State};
 
 /// The open panel. The sidebar takes `SIDEBAR` of its width; the rest is the section's.
 pub const PANEL: (f32, f32) = (800.0, 330.0);
 const SIDEBAR: f32 = 150.0;
+/// A section's width: the panel less the sidebar and the section's padding.
+const BODY_W: f32 = PANEL.0 - SIDEBAR - 36.0;
 /// The overlay canvas: the open panel plus room for its shadow. Only the island takes clicks.
 pub const CANVAS: (f32, f32) = (PANEL.0 + 60.0, PANEL.1 + 40.0);
-/// How far the collapsed island reaches past each side of the notch: further for each count of
-/// unread things beside the status dot, further still while it peeks at something new.
+/// How far the collapsed island reaches past each side of the notch: further for each badge
+/// beside the status dot (and each character past its first), further still while it peeks at
+/// something new.
 const WING: f32 = 30.0;
 const BADGE_WING: f32 = 24.0;
+const BADGE_CHAR: f32 = 6.0;
 const PEEK_WING: f32 = 110.0;
 /// The peek's line under the notch.
 const PEEK_H: f32 = 46.0;
@@ -32,6 +37,11 @@ const WHITE: Color = Color::WHITE;
 fn rgb(hex: u32) -> Color {
     let c = |s: u32| ((hex >> s) & 0xff) as f32 / 255.0;
     Color { r: c(16), g: c(8), b: c(0), a: 1.0 }
+}
+/// Text that reads on a fill of `hex`: black on a light calendar colour, white otherwise.
+fn ink(hex: u32) -> Color {
+    let c = rgb(hex);
+    if 0.299 * c.r + 0.587 * c.g + 0.114 * c.b > 0.65 { BLACK } else { WHITE }
 }
 fn dim() -> Color { WHITE.alpha(0.55) }
 fn faint() -> Color { WHITE.alpha(0.08) }
@@ -64,7 +74,8 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
     let r = if open { 30.0 } else if peek.is_some() { 22.0 } else { s.geo.height * 0.42 };
     let body = if open { expanded(s) } else { collapsed(s, peek) };
     // Open, the panel is as tall as its section's content; the height springs with the width.
-    let wing = if peek.is_some() { PEEK_WING } else { WING + BADGE_WING * alerts(s).len() as f32 };
+    let badges: f32 = alerts(s).iter().map(|(text, ..)| BADGE_WING + BADGE_CHAR * text.chars().count().saturating_sub(1) as f32).sum();
+    let wing = if peek.is_some() { PEEK_WING } else { WING + badges };
     let height = s.geo.height + if peek.is_some() { PEEK_H } else { 0.0 };
     let shape = if open { col().w(PANEL.0).max_h(PANEL.1) } else { col().size(s.geo.width + 2.0 * wing, height) };
     let island = shape.key("island").hit().fill(BLACK)
@@ -95,21 +106,27 @@ fn unread_pulls(s: &State) -> usize { unread_yours(s) + unread_reviews(s) }
 
 fn unread_issues(s: &State) -> usize { issues::unread_count(&s.linear.data.list, &s.linear.read) }
 
-/// The counts on the collapsed island, one per integration with something unread. None for a
-/// mock, which would otherwise sit there for good on a Mac that never connects it; scenes and
-/// demo mode show the mock's.
-fn alerts(s: &State) -> Vec<(usize, Color)> {
+/// The badges on the collapsed island, as (text, fill, ink): a count per integration with
+/// something unread, then the time to a meeting that starts soon. None for a mock, which would
+/// otherwise sit there for good on a Mac that never connects it; scenes and demo mode show the
+/// mock's.
+fn alerts(s: &State) -> Vec<(String, Color, Color)> {
     let real = |origin: &Origin| *origin != Origin::Mock || crate::sandboxed();
-    let mut counts = vec![];
-    if real(&s.github.data.origin) { counts.push((unread_pulls(s), purple())); }
-    if real(&s.linear.data.origin) { counts.push((unread_issues(s), indigo())); }
-    counts.retain(|(n, _)| *n > 0);
-    counts
+    let mut badges = vec![];
+    for (origin, n, color) in [(&s.github.data.origin, unread_pulls(s), purple()), (&s.linear.data.origin, unread_issues(s), indigo())] {
+        if real(origin) && n > 0 { badges.push((n.to_string(), color, WHITE)); }
+    }
+    if real(&s.calendar.data.origin) && let Some(e) = agenda::starting(&s.calendar.data.events, s.snap.now, agenda::countdown()).first() {
+        badges.push((agenda::until(e.start - s.snap.now), rgb(e.color), ink(e.color)));
+    }
+    badges
 }
 
-fn badge(n: usize, color: Color) -> El {
-    el().h(16.0).min_w(16.0).px(5.0).radius(8.0).fill(color).center().child(label(n.to_string(), 10.0, 700.0, WHITE))
+fn pill(text: String, fill: Color, ink: Color) -> El {
+    el().h(16.0).min_w(16.0).px(5.0).radius(8.0).fill(fill).center().child(label(text, 10.0, 700.0, ink))
 }
+
+fn badge(n: usize, color: Color) -> El { pill(n.to_string(), color, WHITE) }
 
 /// Collapsed: a status dot on the left wing with the counts of unread things, the current
 /// primary on the right. A peek adds a line under the notch.
@@ -121,7 +138,7 @@ fn collapsed(s: &State, peek: Option<&Peek>) -> El {
         (None, None) => WHITE.alpha(0.15),
     };
     let mut left = row().gap(6.0).items_center().child(el().size(8.0, 8.0).radius(4.0).fill(dot));
-    for (n, color) in alerts(s) { left = left.child(badge(n, color)); }
+    for (text, fill, ink) in alerts(s) { left = left.child(pill(text, fill, ink)); }
     let right = match &snap.primary {
         Some(p) => avatar(&p.who, 18.0, None),
         None => el().size(18.0, 18.0),
@@ -130,7 +147,11 @@ fn collapsed(s: &State, peek: Option<&Peek>) -> El {
     let mut c = col().key("collapsed").w_full().h_full().transition(Transition::opacity()).child(top);
     if let Some(peek) = peek {
         c = c.child(row().key("peek").w_full().h(PEEK_H).px(16.0).pb(6.0).gap(10.0).items_center()
-            .child(avatar(&initials(&peek.who), 26.0, None))
+            .child(match &peek.mark {
+                Mark::Person(who) => avatar(&initials(who), 26.0, None),
+                Mark::Countdown { text, color } => el().size(26.0, 26.0).radius(8.0).fill(rgb(*color)).center()
+                    .child(label(text, 10.5, 700.0, ink(*color))),
+            })
             .child(col().grow(1.0).min_w(0.0).gap(2.0)
                 .child(label(&peek.headline, 12.5, 600.0, WHITE).truncate())
                 .child(label(&peek.detail, 11.5, 500.0, dim()).truncate())));
@@ -147,6 +168,7 @@ fn expanded(s: &State) -> El {
             Section::FireHydrant => fire(s),
             Section::GitHub => pull_list(s),
             Section::Linear => ticket_list(s),
+            Section::Calendar => agenda_view(s),
         },
     };
     col().key("expanded").w_full().transition(Transition::blur_replace())
@@ -168,6 +190,7 @@ fn source(s: &State, section: Section) -> (&Origin, &'static str, &'static str) 
         Section::FireHydrant => (&s.snap.origin, "FireHydrant", crate::firehydrant::INTEGRATION.id),
         Section::GitHub => (&s.github.data.origin, "GitHub", crate::github::INTEGRATION.id),
         Section::Linear => (&s.linear.data.origin, "Linear", crate::linear::INTEGRATION.id),
+        Section::Calendar => (&s.calendar.data.origin, "Calendar", crate::calendar::INTEGRATION.id),
     }
 }
 
@@ -210,11 +233,12 @@ fn body_key(s: &State) -> &'static str {
         (Section::FireHydrant, FireView::Incidents) => "body-incidents",
         (Section::GitHub, _) => "body-github",
         (Section::Linear, _) => "body-linear",
+        (Section::Calendar, _) => "body-calendar",
     }
 }
 
 fn sidebar(s: &State) -> El {
-    let item = |section: Section, key: &'static str, count: usize, color: Color| {
+    let item = |section: Section, key: &'static str, badge: Option<El>| {
         let (origin, name, _) = source(s, section);
         let on = s.section == section;
         let mut r = row().key(key).hit().w_full().h(30.0).px(10.0).gap(8.0).items_center().radius(10.0)
@@ -223,13 +247,17 @@ fn sidebar(s: &State) -> El {
             .child(el().size(6.0, 6.0).radius(3.0).fill(origin_color(origin)))
             .child(label(name, 12.5, if on { 600.0 } else { 500.0 }, if on { WHITE } else { dim() }))
             .child(spacer());
-        if count > 0 { r = r.child(badge(count, color)); }
+        if let Some(b) = badge { r = r.child(b); }
         r
     };
+    let count = |n: usize, color: Color| (n > 0).then(|| badge(n, color));
+    let next = agenda::starting(&s.calendar.data.events, s.snap.now, Duration::hours(1)).first()
+        .map(|e| pill(agenda::until(e.start - s.snap.now), rgb(e.color), ink(e.color)));
     col().w(SIDEBAR).pl(12.0).pt(8.0).gap(2.0)
-        .child(item(Section::FireHydrant, "nav-firehydrant", s.snap.incidents.len(), red()))
-        .child(item(Section::GitHub, "nav-github", unread_pulls(s), purple()))
-        .child(item(Section::Linear, "nav-linear", unread_issues(s), indigo()))
+        .child(item(Section::FireHydrant, "nav-firehydrant", count(s.snap.incidents.len(), red())))
+        .child(item(Section::GitHub, "nav-github", count(unread_pulls(s), purple())))
+        .child(item(Section::Linear, "nav-linear", count(unread_issues(s), indigo())))
+        .child(item(Section::Calendar, "nav-calendar", next))
 }
 
 /// Space kept clear on each side of a real notch.
@@ -538,4 +566,145 @@ fn ticket_row(t: &Ticket, unread: &[&Notice], now: NaiveDateTime) -> El {
     let id = t.id.clone();
     list_row(format!("ticket-{}", t.id), unread.len(), indigo(), &t.name(), detail, chip(&t.state, rgb(t.color)),
         move |s: &mut State, tx: &mut Tx| s.open_ticket(&id, tx))
+}
+
+/// Calendar: the meeting you're in or the next one, what's left of today and tomorrow, and the
+/// day on a timeline. A click shows a meeting in the Calendar app; Join opens its call.
+fn agenda_view(s: &State) -> El {
+    let now = s.snap.now;
+    let day = agenda::day(&s.calendar.data.events, now);
+    let left = day.later.len() + day.focus.iter().count();
+    let mut header = row().w_full().h(22.0).gap(6.0).items_center()
+        .child(caps(&if left > 0 { format!("Today · {left} left") } else { "Today".to_string() }))
+        .child(spacer());
+    for e in day.all_day.iter().take(2) {
+        header = header.child(row().gap(5.0).items_center().px(8.0).h(20.0).max_w(170.0).radius(10.0).fill(rgb(e.color).alpha(0.18))
+            .child(el().size(6.0, 6.0).radius(3.0).fill(rgb(e.color)))
+            .child(label(&e.title, 11.0, 600.0, WHITE.alpha(0.85)).shrink().truncate()));
+    }
+    if day.all_day.len() > 2 { header = header.child(label(format!("+{}", day.all_day.len() - 2), 11.0, 600.0, dim())); }
+    col().w_full().gap(10.0)
+        .child(header)
+        .child(row().w_full().gap(12.0).child(focus_card(&day, now)).child(coming_up(&day, now)))
+        .child(timeline(&day, now))
+}
+
+const FOCUS_W: f32 = 250.0;
+
+/// What's unsure about a meeting, as a suffix for its detail line.
+fn answer(e: &agenda::Event) -> &'static str {
+    match e.reply { Reply::Yes => "", Reply::Maybe => " · maybe", Reply::NotYet => " · not answered" }
+}
+
+/// The meeting you're in, with its time left, or the next one today; Join opens its call.
+fn focus_card(day: &Day, now: NaiveDateTime) -> El {
+    let c = card().w(FOCUS_W).key("focus");
+    let Some(focus) = day.focus else {
+        let mut c = c.child(caps("Rest of today")).child(label("No more meetings today", 15.0, 650.0, WHITE));
+        if let Some(first) = day.tomorrow.first() {
+            c = c.child(label(format!("Tomorrow starts at {} with {}", first.start.format("%H:%M"), first.title), 12.0, 500.0, dim()).max_lines(2));
+        }
+        return c;
+    };
+    let e = focus.event();
+    let color = rgb(e.color);
+    let (tag, when) = match focus {
+        Focus::Now(_) => ("Now", format!("{} left", agenda::until(e.end - now))),
+        Focus::Next(_) => ("Next", format!("in {}", agenda::until(e.start - now))),
+    };
+    let mut c = c
+        .child(row().w_full().gap(6.0).items_center()
+            .child(el().size(8.0, 8.0).radius(4.0).fill(color))
+            .child(caps(tag))
+            .child(spacer())
+            .child(label(when, 11.5, 650.0, color)))
+        .child(label(&e.title, 15.0, 650.0, WHITE).max_lines(2))
+        .child(label(format!("{} · {}{}", e.hours(), e.place(), answer(e)), 12.0, 500.0, dim()).truncate());
+    if let Focus::Now(_) = focus {
+        let done = ((now - e.start).num_seconds() as f32 / (e.end - e.start).num_seconds().max(1) as f32).clamp(0.0, 1.0);
+        c = c.child(el().key("meeting-progress").w_full().h(6.0).radius(3.0).fill(faint())
+            .child(el().h_full().w((done * (FOCUS_W - 28.0)).max(6.0)).radius(3.0).fill(color)));
+    }
+    if let Some(join) = &e.join {
+        let key = e.key();
+        c = c.child(el().key("join").hit().w_full().h(28.0).radius(14.0).fill(WHITE).hover(WHITE.alpha(0.85)).center()
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| s.join(&key, tx))
+            .child(label(format!("Join {}", join.service), 12.0, 700.0, BLACK)));
+    }
+    c
+}
+
+const EVENT_ROW: f32 = 40.0;
+const EVENT_GAP: f32 = 6.0;
+const DIVIDER: f32 = 18.0;
+/// How tall the list beside the focus card grows before it scrolls.
+const COMING_UP_H: f32 = 170.0;
+
+/// The rest of today's meetings, then tomorrow's.
+fn coming_up(day: &Day, now: NaiveDateTime) -> El {
+    let mut rows: Vec<El> = day.later.iter().map(|e| event_row(e, now, true)).collect();
+    let mut height = rows.len() as f32 * EVENT_ROW;
+    if !day.tomorrow.is_empty() {
+        rows.push(row().key("tomorrow").w_full().h(DIVIDER).px(4.0).items_end().child(caps("Tomorrow")));
+        rows.extend(day.tomorrow.iter().map(|e| event_row(e, now, false)));
+        height += DIVIDER + day.tomorrow.len() as f32 * EVENT_ROW;
+    }
+    if rows.is_empty() {
+        return col().grow(1.0).min_w(0.0).pt(4.0).child(label("Nothing else today or tomorrow", 13.0, 500.0, dim()));
+    }
+    height += (rows.len() - 1) as f32 * EVENT_GAP;
+    let mut list = col().w_full().gap(EVENT_GAP);
+    for r in rows { list = list.child(r); }
+    let list = if height > COMING_UP_H {
+        col().key("list-calendar").w_full().h(COMING_UP_H).scroll(ScrollSpec { stick_bottom: false }).scroll_edge_fade(10.0).child(list)
+    } else { list };
+    col().grow(1.0).min_w(0.0).child(list)
+}
+
+fn event_row(e: &agenda::Event, now: NaiveDateTime, today: bool) -> El {
+    let color = rgb(e.color);
+    let ongoing = e.covers(now);
+    let sure = e.reply == Reply::Yes;
+    let key = e.key();
+    let show = key.clone();
+    let mut r = row().key(format!("event-{key}")).hit().w_full().h(EVENT_ROW).gap(10.0).items_center().px(10.0).radius(12.0)
+        .fill(WHITE.alpha(0.05)).hover(WHITE.alpha(0.12))
+        .on_press(move |s: &mut State| s.show_event(&show))
+        .child(col().w(38.0).gap(1.0)
+            .child(label(if ongoing { "now".to_string() } else { e.start.format("%H:%M").to_string() }, 12.0, 650.0, if ongoing { green() } else { WHITE }))
+            .child(label(agenda::length(e.end - e.start), 10.5, 500.0, dim())))
+        .child(el().w(3.0).h(26.0).radius(1.5).fill(color.alpha(if sure { 1.0 } else { 0.45 })))
+        .child(col().grow(1.0).min_w(0.0).gap(2.0)
+            .child(label(&e.title, 13.0, 600.0, WHITE.alpha(if sure { 0.95 } else { 0.7 })).truncate())
+            .child(label(format!("{}{}", e.place(), answer(e)), 11.5, 500.0, dim()).truncate()));
+    // Join only for what's on now or about to start: the focus card has the next one's.
+    let joinable = today && (ongoing || e.start - now <= agenda::countdown());
+    if let (true, Some(Join { service, .. })) = (joinable, &e.join) {
+        r = r.child(row().key(format!("join-{key}")).hit().px(9.0).h(22.0).radius(11.0).items_center().fill(color.alpha(0.2)).hover(color.alpha(0.35))
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| s.join(&key, tx))
+            .child(label(if service.len() <= 5 { format!("Join {service}") } else { "Join".to_string() }, 11.0, 650.0, WHITE)));
+    }
+    r
+}
+
+/// Today's meetings on one track, ended ones faded, with a line at now. It spans 08:00 to 19:00,
+/// widened to fit the meetings and the time.
+fn timeline(day: &Day, now: NaiveDateTime) -> El {
+    let midnight = now.date().and_time(NaiveTime::MIN);
+    let minute = |t: NaiveDateTime| (t - midnight).num_minutes().clamp(0, 24 * 60);
+    let first = day.timed.iter().map(|e| minute(e.start)).chain([minute(now), 8 * 60]).min().unwrap_or(0) / 60 * 60;
+    let last = (day.timed.iter().map(|e| minute(e.end)).chain([minute(now) + 1, 19 * 60]).max().unwrap_or(24 * 60) + 59) / 60 * 60;
+    let x = |m: i64| (m - first) as f32 / (last - first).max(60) as f32 * BODY_W;
+    let mut track = el().key("timeline").w(BODY_W).h(12.0).radius(6.0).fill(faint());
+    for e in &day.timed {
+        let (from, to) = (x(minute(e.start)), x(minute(e.end)));
+        track = track.child(el().absolute(from, 0.0).w((to - from).max(4.0)).h(12.0).radius(4.0)
+            .fill(rgb(e.color).alpha(if e.end <= now { 0.3 } else { 0.85 })));
+    }
+    track = track.child(el().key("now").absolute(x(minute(now)) - 1.0, -3.0).w(2.0).h(18.0).radius(1.0).fill(WHITE));
+    let mut hours = el().w(BODY_W).h(12.0);
+    for h in (first / 60..=last / 60).step_by(2) {
+        hours = hours.child(label(format!("{h:02}"), 9.5, 600.0, dim()).absolute(x(h * 60) - 6.0, 0.0));
+    }
+    col().w_full().gap(4.0).child(track).child(hours)
 }

@@ -2,11 +2,13 @@
 //!
 //! `cargo run --release` puts it at the top of whichever display the pointer is on. Headless stills, with no window:
 //! `cargo run -- --scene open --snap snaps/open.png` (scenes: collapsed, open, incidents,
-//! offhours, pulls, reviews, linear, peek).
+//! offhours, pulls, reviews, linear, calendar, peek, soon).
 //!
-//! Open, the panel has a sidebar of integrations (FireHydrant, GitHub, Linear) and shows the
-//! selected one's data beside it.
+//! Open, the panel has a sidebar of integrations (FireHydrant, GitHub, Linear, Calendar) and
+//! shows the selected one's data beside it.
 
+mod agenda;
+mod calendar;
 mod demo;
 mod feed;
 mod firehydrant;
@@ -26,6 +28,7 @@ mod store;
 mod view;
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
@@ -34,6 +37,7 @@ use chrono::{Local, NaiveDate, NaiveDateTime};
 use rune::machine::Seq;
 use rune::{Align, App, AppHandle, AppSpec, DisplayTarget, OverlayInput, OverlayLevel, OverlayOptions, OverlayPlacement, OverlaySpec, RunOptions, ScreenEdge, Tx, WindowSpec};
 
+use agenda::Agenda;
 use island::{Event, Island};
 use notch::NotchGeo;
 use oncall::{Data, Origin, Snapshot};
@@ -43,7 +47,7 @@ use pulls::Pulls;
 use read::ReadState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Section { FireHydrant, GitHub, Linear }
+pub enum Section { FireHydrant, GitHub, Linear, Calendar }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FireView { OnCall, Incidents }
@@ -58,11 +62,19 @@ pub struct Peek {
     pub section: Section,
     /// For GitHub, which list.
     pub pulls: Option<PullView>,
-    /// Who did it, for the avatar.
-    pub who: String,
+    pub mark: Mark,
     pub headline: String,
     pub detail: String,
     pub until: f64,
+}
+
+/// What a peek shows beside its text.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Mark {
+    /// Who did it, as an avatar.
+    Person(String),
+    /// The time to a meeting, on its calendar's colour.
+    Countdown { text: String, color: u32 },
 }
 
 const PEEK_SECONDS: f64 = 6.0;
@@ -83,6 +95,9 @@ pub struct State {
     pub control: Option<Sender<()>>,
     pub github: Feed<Pulls>,
     pub linear: Feed<Issues>,
+    pub calendar: Feed<Agenda>,
+    /// The meetings already peeked at as starting, by `agenda::Event::key`.
+    pub reminded: HashSet<String>,
     pub peek: Option<Peek>,
     pub waker: Option<rune::Waker>,
     /// Scenes pin the clock and the notch so snapshots are reproducible.
@@ -152,6 +167,8 @@ fn init() -> State {
         control: None,
         github: Feed::new(pulls::mock(now()), mock_read()),
         linear: Feed::new(issues::mock(now()), mock_read()),
+        calendar: Feed::new(agenda::mock(now()), mock_read()),
+        reminded: HashSet::new(),
         peek: None,
         waker: None,
         frozen: false,
@@ -170,6 +187,7 @@ fn start_fetching(s: &mut State, wake: rune::Waker) {
     connect_firehydrant(s);
     connect_github(s);
     connect_linear(s);
+    connect_calendar(s);
 }
 
 /// Reconnects one integration after Settings saved it.
@@ -177,6 +195,7 @@ pub fn reconnect(s: &mut State, id: &str) {
     match id {
         "github" => connect_github(s),
         "linear" => connect_linear(s),
+        "calendar" => connect_calendar(s),
         _ => connect_firehydrant(s),
     }
 }
@@ -233,7 +252,7 @@ fn take_pulls(s: &mut State, clock: f64) -> bool {
         s.peek = Some(Peek {
             section: Section::GitHub,
             pulls: Some(if p.request.is_some() { PullView::Reviews } else { PullView::Yours }),
-            who: a.who.clone(),
+            mark: Mark::Person(a.who.clone()),
             headline: format!("{} on #{}", a.headline(), p.number),
             detail: if a.excerpt.is_empty() { p.title.clone() } else { a.excerpt.clone() },
             until: clock + PEEK_SECONDS,
@@ -268,7 +287,7 @@ fn take_issues(s: &mut State, clock: f64) -> bool {
         s.peek = Some(Peek {
             section: Section::Linear,
             pulls: None,
-            who: if n.who.is_empty() { "Linear".into() } else { n.who.clone() },
+            mark: Mark::Person(if n.who.is_empty() { "Linear".into() } else { n.who.clone() }),
             headline: format!("{} on {on}", n.headline),
             detail: if n.excerpt.is_empty() { t.title.clone() } else { n.excerpt.clone() },
             until: clock + PEEK_SECONDS,
@@ -277,7 +296,60 @@ fn take_issues(s: &mut State, clock: f64) -> bool {
     true
 }
 
+/// (Re)connects to the Calendar app, as `connect_firehydrant` does. Once access was granted,
+/// losing it shows as an error rather than as the mock.
+fn connect_calendar(s: &mut State) {
+    if s.peek.as_ref().is_some_and(|p| p.section == Section::Calendar) { s.peek = None; }
+    let live = !mock_only() && (calendar::INTEGRATION.configured() || calendar::enabled());
+    match (live, s.waker.clone()) {
+        (true, Some(wake)) => {
+            calendar::ask_again();
+            s.calendar.start("calendar", calendar::EVERY, calendar::fetcher(), wake, Agenda::loading(), mock_read());
+        }
+        _ => {
+            let mut found = agenda::mock(now());
+            if demo::on() && calendar::INTEGRATION.configured() { found.origin = Origin::Live { at: now() }; }
+            s.calendar.show(found, mock_read());
+        }
+    }
+}
+
+/// Takes in finished calendar reads, and peeks once at each meeting about to start. The peek
+/// waits while the panel is open.
+fn take_agenda(s: &mut State, clock: f64) -> bool {
+    if calendar::answered() { connect_calendar(s); }
+    let arrived = s.calendar.take(|_, _| {});
+    let events = &s.calendar.data.events;
+    if arrived { s.reminded.retain(|key| events.iter().any(|e| e.key() == *key)); }
+    if !matches!(s.calendar.data.origin, Origin::Live { .. }) || s.island.is_open() { return arrived; }
+    let now = now();
+    let Some(e) = agenda::starting(events, now, agenda::lead()).into_iter().find(|e| !s.reminded.contains(&e.key())) else { return arrived };
+    s.reminded.insert(e.key());
+    s.peek = Some(Peek {
+        section: Section::Calendar,
+        pulls: None,
+        mark: Mark::Countdown { text: agenda::until(e.start - now), color: e.color },
+        headline: e.title.clone(),
+        detail: format!("Starts at {} · {}", e.start.format("%H:%M"), e.place()),
+        until: clock + PEEK_SECONDS,
+    });
+    true
+}
+
 impl State {
+    fn event(&self, key: &str) -> Option<&agenda::Event> { self.calendar.data.events.iter().find(|e| e.key() == key) }
+
+    /// Shows a meeting in the Calendar app.
+    pub fn show_event(&mut self, key: &str) {
+        if let Some(e) = self.event(key) { calendar::show(e); }
+    }
+
+    /// Opens a meeting's call.
+    pub fn join(&mut self, key: &str, tx: &mut Tx) {
+        let Some(url) = self.event(key).and_then(|e| e.join.as_ref()).map(|j| j.url.clone()).filter(|u| !u.is_empty()) else { return };
+        if let Err(e) = tx.open_url(&url) { eprintln!("calendar: can't open {url}: {e:?}"); }
+    }
+
     /// Opens an issue or project where its oldest unread notification points, and marks it read.
     pub fn open_ticket(&mut self, id: &str, tx: &mut Tx) {
         let ln = &mut self.linear;
@@ -374,6 +446,7 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         let t = now();
         changed |= take_pulls(s, clock);
         changed |= take_issues(s, clock);
+        changed |= take_agenda(s, clock);
         let fetched = take_results(s);
         if fetched || t.format("%H:%M").to_string() != s.snap.now.format("%H:%M").to_string() {
             s.snap = Snapshot::build(&s.data, t);
@@ -398,6 +471,7 @@ fn freeze(s: &mut State, at: NaiveDateTime) {
     s.snap = Snapshot::build(&s.data, at);
     s.github.show(pulls::mock(at), ReadState::memory(at - chrono::Duration::days(30)));
     s.linear.show(issues::mock(at), ReadState::memory(at - issues::look_back()));
+    s.calendar.show(agenda::mock(at), ReadState::memory(at));
 }
 
 fn spec() -> AppSpec<State> {
@@ -410,11 +484,19 @@ fn spec() -> AppSpec<State> {
             ("pulls", |s| { freeze(s, scene_time(10, 14, 5)); s.island = Island::Open; s.section = Section::GitHub; }),
             ("reviews", |s| { freeze(s, scene_time(10, 14, 5)); s.island = Island::Open; s.section = Section::GitHub; s.pulls = PullView::Reviews; }),
             ("linear", |s| { freeze(s, scene_time(10, 14, 5)); s.island = Island::Open; s.section = Section::Linear; }),
+            ("calendar", |s| { freeze(s, scene_time(10, 14, 5)); s.island = Island::Open; s.section = Section::Calendar; }),
             ("peek", |s| {
                 freeze(s, scene_time(10, 14, 5));
                 let (pull, a) = (&s.github.data.list[0], &s.github.data.list[0].activity[1]);
-                s.peek = Some(Peek { section: Section::GitHub, pulls: Some(PullView::Yours), who: a.who.clone(), headline: format!("{} on #{}", a.headline(), pull.number),
-                    detail: a.excerpt.clone(), until: 0.0 });
+                s.peek = Some(Peek { section: Section::GitHub, pulls: Some(PullView::Yours), mark: Mark::Person(a.who.clone()),
+                    headline: format!("{} on #{}", a.headline(), pull.number), detail: a.excerpt.clone(), until: 0.0 });
+            }),
+            ("soon", |s| {
+                let at = scene_time(10, 14, 56);
+                freeze(s, at);
+                let e = s.calendar.data.events.iter().find(|e| e.title == "1:1 with ZQ").unwrap();
+                s.peek = Some(Peek { section: Section::Calendar, pulls: None, mark: Mark::Countdown { text: agenda::until(e.start - at), color: e.color },
+                    headline: e.title.clone(), detail: format!("Starts at {} · {}", e.start.format("%H:%M"), e.place()), until: 0.0 });
             }),
         ],
         poll: Some(poll),
@@ -504,6 +586,22 @@ fn probe_linear() {
     }
 }
 
+/// `--probe-calendar` prints today's and tomorrow's meetings as the Calendar section reads them.
+/// It never asks for access.
+fn probe_calendar() {
+    match calendar::fetch(now()) {
+        Ok(found) => {
+            println!("{} calendars, {} events today and tomorrow", found.calendars, found.events.len());
+            for e in &found.events {
+                let when = if e.all_day { format!("{} all day", e.start.format("%a %-d %b")) } else { format!("{} {}", e.start.format("%a %-d %b"), e.hours()) };
+                let join = e.join.as_ref().map(|j| format!(" · join on {}", j.service)).unwrap_or_default();
+                println!("  {when:22} {} [{} · {:?}{join}]", e.title, e.calendar, e.reply);
+            }
+        }
+        Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--login") {
@@ -512,6 +610,7 @@ fn main() {
     if args.iter().any(|a| a == "--version") { return println!("notch-assistant {}", env!("CARGO_PKG_VERSION")); }
     if args.iter().any(|a| a == "--probe-github") { return probe_github(); }
     if args.iter().any(|a| a == "--probe-linear") { return probe_linear(); }
+    if args.iter().any(|a| a == "--probe-calendar") { return probe_calendar(); }
     if args.iter().any(|a| a == "--probe" || a == "--probe-raw") {
         return probe(args.iter().any(|a| a == "--probe-raw"));
     }
