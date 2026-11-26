@@ -8,7 +8,7 @@ notch".
 
 ![Open panel](snaps/open.png)
 
-**Demo video:** [demo/notch-assistant.mp4](demo/notch-assistant.mp4) (40 s: hover, each integration in the sidebar, Settings, connecting).
+**Demo video:** [demo/notch-assistant.mp4](demo/notch-assistant.mp4) (43 s: hover, each integration in the sidebar and the pull requests to review, Settings, connecting).
 
 | Collapsed | Something new | Incidents | Off hours |
 | --- | --- | --- | --- |
