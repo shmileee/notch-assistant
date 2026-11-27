@@ -19,9 +19,10 @@ There is no key to paste. The app reads your calendars through macOS, and nothin
 > Calendars.
 
 > [!WARNING]
-> The app is ad-hoc signed, and macOS ties the permission to the app's signature, which changes with every
-> build. After an upgrade macOS may ask again. Once you've allowed access, the app asks by itself at
-> launch, and if access is off it says so instead of showing mock meetings.
+> macOS ties the permission to the app's signature. Releases are all signed with the same certificate, so
+> the permission carries over upgrades. A build from source (`make install`) is ad-hoc signed and new to
+> macOS each time, so macOS may ask again. Once you've allowed access, the app asks by itself at launch,
+> and if access is off it says so instead of showing mock meetings.
 
 If you turned access off, Settings › Calendar has a button that opens the right page of System Settings.
 Once you turn it back on there, the panel notices within a minute.

@@ -146,7 +146,7 @@ fn request(done: Box<dyn FnOnce() + Send>) {
 }
 
 /// Asks again when access was granted once but macOS no longer knows it. macOS ties the answer
-/// to the app's signature, and an ad-hoc signature changes with every build, upgrades included.
+/// to the app's signature, and an ad-hoc one (a build from source) changes with every build.
 pub fn ask_again() {
     if enabled() && status() == Access::NotAsked {
         ASKED_AGAIN.call_once(|| request(Box::new(|| ANSWERED.store(true, Ordering::SeqCst))));

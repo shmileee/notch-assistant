@@ -78,7 +78,9 @@ a GitHub token and a Linear API key (see [GitHub and Linear](#github-and-linear)
 - **Upgrading and uninstalling:** the app restarts itself when a new version replaces it and quits when it's
   removed, so `brew upgrade` and `brew uninstall` need no extra step (Homebrew's own quit is skipped on Macs
   whose login comes from single sign-on).
-- **Signing:** the app is ad-hoc signed, not notarized. The cask clears the quarantine flag on download.
+- **Signing:** releases are signed with the project's own certificate, not Apple's, so macOS keeps the
+  Calendar permission across upgrades. The app isn't notarized; the cask clears the quarantine flag on
+  download. A build from source is ad-hoc signed, unless `CODESIGN_IDENTITY` names a certificate.
 
 ## FireHydrant
 
@@ -118,7 +120,7 @@ the service. How to create them, what counts, and what each one calls:
 ## Calendar
 
 Calendar needs no key: it reads every account in the Calendar app through macOS, once you click Allow
-access in Settings › Calendar. What it shows and what to do when macOS asks again after an upgrade:
+access in Settings › Calendar. What it shows and what to do when macOS asks again:
 [docs/calendar.md](docs/calendar.md).
 
 ## Development
@@ -145,8 +147,9 @@ terminal, `ffmpeg` and the Xcode command-line tools. When you add a feature, add
 
 **Releasing.** Bump `version` in `Cargo.toml`, commit, then `git tag vX.Y.Z && git push --tags`.
 `.github/workflows/release.yml` builds `NotchAssistant-<version>-arm64.zip` on an Apple-silicon runner and
-attaches it to the GitHub release (`make dist` makes the same zip locally). Renovate in the tap then
-proposes the cask update. `make icon` redraws `assets/AppIcon.icns`.
+attaches it to the GitHub release (`make dist` makes the same zip locally). It signs the app with the
+certificate in the `MACOS_SIGNING_P12` and `MACOS_SIGNING_PASSWORD` secrets and won't release without
+it. Renovate in the tap then proposes the cask update. `make icon` redraws `assets/AppIcon.icns`.
 
 ### How it works
 
@@ -176,7 +179,7 @@ proposes the cask update. `make icon` redraws `assets/AppIcon.icns`.
 | `src/login.rs` | Open at login (`SMAppService`); only the app bundle can register. |
 | `src/installed.rs` | Restarts the app when its installed copy is replaced and quits it when removed. |
 | `src/demo.rs` | Demo mode for recordings. |
-| `scripts/bundle.sh`, `Makefile` | The app bundle (Info.plist with the calendar usage text, icon, ad-hoc signature), install, uninstall and release zip. |
+| `scripts/bundle.sh`, `Makefile` | The app bundle (Info.plist with the calendar usage text, icon, signature), install, uninstall and release zip. |
 
 **Adding an integration.** Declare an `Integration` (its fields, the one it can't run without, and a test) and add it to
 `integrations::ALL`; it appears in Settings, and its values come from `integration.value(key)`. Fetch its

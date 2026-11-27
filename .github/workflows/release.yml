@@ -23,8 +23,30 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The app is signed with the project's own certificate, so macOS keeps its permissions
+      # across upgrades; an ad-hoc release would make every user allow Calendar again.
+      - name: Import the signing certificate
+        env:
+          P12: ${{ secrets.MACOS_SIGNING_P12 }}
+          PASSWORD: ${{ secrets.MACOS_SIGNING_PASSWORD }}
+        run: |
+          [ -n "$P12" ] || { echo "The MACOS_SIGNING_P12 secret isn't set"; exit 1; }
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          security create-keychain -p "" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "" "$keychain"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" -P "$PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$keychain" >/dev/null
+          echo "CODESIGN_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
       - name: Build and zip the app
-        run: make dist
+        env:
+          CODESIGN_IDENTITY: Notch Assistant Signing
+        run: |
+          make dist
+          codesign -dvv "target/bundle.noindex/Notch Assistant.app" 2>&1 | grep -q "Authority=Notch Assistant Signing"
 
       - name: Publish the release
         env:

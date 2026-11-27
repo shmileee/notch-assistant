@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Builds "Notch Assistant.app" from the release binary, ad-hoc signed.
+# Builds "Notch Assistant.app" from the release binary.
 #
 #   scripts/bundle.sh [out-dir]        default: target/bundle.noindex
+#
+# CODESIGN_IDENTITY signs it with that certificate (CODESIGN_KEYCHAIN says where it is), as
+# releases do; without it the bundle is ad-hoc signed.
 #
 # The bundle is an agent app (LSUIElement): no Dock icon, as when run from the terminal.
 set -euo pipefail
@@ -41,6 +44,11 @@ cat >"$app/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc: enough to run locally and to register as a login item. Not notarized.
-codesign --force --sign - --identifier "$id" "$app" >/dev/null 2>&1
+# macOS ties a permission (Calendar) to the signing certificate when there is one, and to the
+# build itself when ad-hoc, so only a certificate keeps permissions across upgrades. Not notarized.
+if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+  codesign --force --sign "$CODESIGN_IDENTITY" ${CODESIGN_KEYCHAIN:+--keychain "$CODESIGN_KEYCHAIN"} --identifier "$id" "$app" >/dev/null
+else
+  codesign --force --sign - --identifier "$id" "$app" >/dev/null 2>&1
+fi
 echo "$app"
